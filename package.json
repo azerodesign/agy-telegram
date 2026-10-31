@@ -7,8 +7,8 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "azerodesign",
+  "license": "MIT",
   "dependencies": {
     "tg-rich-messages": "^0.4.0"
   },

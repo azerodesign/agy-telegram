@@ -161,3 +161,9 @@ Service berjalan di background dengan auto-restart:
 - Restart: `/home/ubuntu/agy-telegram/start.sh` atau `sudo systemctl restart agy-telegram`
 - Stop: `/home/ubuntu/agy-telegram/stop.sh` atau `sudo systemctl stop agy-telegram`
 - Live Logs: `sudo journalctl -u agy-telegram -f`
+
+---
+
+## 📄 Lisensi
+
+Proyek ini dilisensikan di bawah lisensi [MIT](LICENSE).
