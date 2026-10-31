@@ -1,0 +1,14 @@
+# Environment and credentials
+.env
+*.env.local
+
+# Backups and temporary files
+*.bak*
+*.log
+bot.pid
+sessions.json
+*.zip
+
+# Dependencies
+node_modules/
+*.diff
