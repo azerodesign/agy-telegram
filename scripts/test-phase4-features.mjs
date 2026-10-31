@@ -206,11 +206,11 @@ async function runPhase4Tests() {
   );
 
   // Test 20: gitCommitAndPush clean tree handling
-  // When working tree is clean (all committed), gitCommitAndPush should cleanly inform without failing
+  // When working tree is clean, gitCommitAndPush should cleanly inform without making a commit
   const gitRes = await gitCommitAndPush('test: should not commit if clean');
   assert(
-    typeof gitRes.success === 'boolean',
-    'gitCommitAndPush handles working tree state cleanly'
+    gitRes.success === false && gitRes.message.includes('Tidak ada perubahan'),
+    'gitCommitAndPush cleanly detects clean working tree and avoids empty commit'
   );
 
   // =========================================================================
