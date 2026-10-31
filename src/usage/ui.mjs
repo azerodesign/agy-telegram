@@ -232,9 +232,10 @@ export function buildAgUsageView(options = {}) {
     inline_keyboard: [
       [
         { text: '🔄 Refresh Kuota', callback_data: 'action:refresh_agusage' },
-        { text: '🌐 Detail 9Router', callback_data: 'view:9usage' }
+        { text: '⚡ Ganti Akun', callback_data: 'view:switch_slot_menu' }
       ],
       [
+        { text: '🌐 Detail 9Router', callback_data: 'view:9usage' },
         { text: '« Ringkasan (/usage)', callback_data: 'view:usage' }
       ]
     ]

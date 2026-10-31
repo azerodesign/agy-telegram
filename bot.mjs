@@ -11,6 +11,25 @@ import {
   formatProgressText
 } from './src/usage/ui.mjs';
 import { loadCache, DEFAULT_CACHE_PATH, DEFAULT_CACHE_TTL_MS } from './src/usage/scanner.mjs';
+import {
+  switchToSlot,
+  rotateToNextHealthySlot,
+  buildSlotSelectorView,
+  isQuotaExhaustedError
+} from './src/usage/switcher.mjs';
+import { processVoiceNote } from './src/voice/stt.mjs';
+import {
+  startLoginFlow,
+  submitAuthCode,
+  hasActiveLoginSession,
+  cancelLoginSession
+} from './src/usage/login-wizard.mjs';
+import {
+  getGitStatus,
+  getGitDiff,
+  gitCommitAndPush,
+  gitPull
+} from './src/git/git-ops.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2673,6 +2692,13 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
         });
       } else {
         if (code !== 0) {
+          if (isQuotaExhaustedError(stderr)) {
+            rotateToNextHealthySlot('quota').then(rotateRes => {
+              console.log(`[Auto-Failover] Quota exhausted: rotated to Slot ${rotateRes.slot}`);
+            }).catch(() => {});
+            reject(new Error(`⏳ <b>Batas Kuota / Rate Limit Terdeteksi!</b>\nGiliran otomatis dialihkan ke akun PRO berikutnya.\n\n<i>Silakan kirim ulang prompt Anda untuk melanjutkan dengan kuota segar.</i>`));
+            return;
+          }
           reject(new Error(`agy exited with code ${code}.\n${stderr}`));
         } else {
           resolve({
@@ -3047,6 +3073,77 @@ async function handleCallback(cb) {
     return;
   }
 
+  // 1.4c Open Slot Switcher Menu
+  if (data === 'view:switch_slot_menu') {
+    const ag = getAgyAccountsUsage();
+    const activeSlot = ag ? ag.activeSlot : '1';
+    const view = buildSlotSelectorView(activeSlot);
+    await editRich(chatId, messageId, view.doc, {
+      reply_markup: view.keyboard
+    });
+    await answerCallbackQuery(queryId);
+    return;
+  }
+
+  // 1.4d Switch to Specific Slot
+  if (data.startsWith('action:switch_slot:')) {
+    const targetSlot = data.slice('action:switch_slot:'.length);
+    const switchRes = await switchToSlot(targetSlot);
+    if (!switchRes.success) {
+      await answerCallbackQuery(queryId, switchRes.message, true);
+      return;
+    }
+    await answerCallbackQuery(queryId, `✅ Berhasil beralih ke Slot ${targetSlot}!`);
+    const updatedView = buildAgUsageView();
+    await editRich(chatId, messageId, updatedView.doc, {
+      reply_markup: updatedView.keyboard
+    }).catch(() => {});
+    return;
+  }
+
+  // 1.5 Git Operations Callbacks
+  if (data === 'git:status') {
+    const gitStatus = await getGitStatus();
+    await editRich(chatId, messageId, gitStatus.text, {
+      reply_markup: gitStatus.keyboard
+    });
+    await answerCallbackQuery(queryId, 'Status Git diperbarui');
+    return;
+  }
+
+  if (data === 'git:diff') {
+    const diffRes = await getGitDiff();
+    await editRich(chatId, messageId, diffRes.text, {
+      reply_markup: {
+        inline_keyboard: [[{ text: '« Kembali ke Status Git', callback_data: 'git:status' }]]
+      }
+    });
+    await answerCallbackQuery(queryId);
+    return;
+  }
+
+  if (data === 'git:commit_push') {
+    await answerCallbackQuery(queryId, '🚀 Memulai commit & push ke GitHub...');
+    const pushRes = await gitCommitAndPush();
+    await editRich(chatId, messageId, pushRes.message, {
+      reply_markup: {
+        inline_keyboard: [[{ text: '« Kembali ke Status Git', callback_data: 'git:status' }]]
+      }
+    });
+    return;
+  }
+
+  if (data === 'git:pull') {
+    await answerCallbackQuery(queryId, '⬇️ Memulai git pull...');
+    const pullRes = await gitPull();
+    await editRich(chatId, messageId, pullRes.message, {
+      reply_markup: {
+        inline_keyboard: [[{ text: '« Kembali ke Status Git', callback_data: 'git:status' }]]
+      }
+    });
+    return;
+  }
+
   // 2. View Models
   if (data === 'view:models') {
     const richDoc = tgRich.doc(
@@ -3326,6 +3423,24 @@ async function handleMessage(msg) {
   const sessionKey = isGroup ? `topic:${chatId}:${threadId}` : userId;
   const session = getSession(sessionKey);
 
+  // Active OAuth Login Wizard interceptor
+  if (hasActiveLoginSession(chatId)) {
+    const rawText = (msg.text || '').trim();
+    if (rawText === '/cancel' || rawText === '🛑 Batalkan') {
+      cancelLoginSession(chatId);
+      await sendRich(chatId, '🚫 <b>Sesi login Google Auth telah dibatalkan.</b>', threadId ? { message_thread_id: threadId } : {});
+      return;
+    }
+
+    const submitted = submitAuthCode(chatId, rawText);
+    if (submitted) {
+      await sendRich(chatId, '⏳ <i>Memproses kode otorisasi Google OAuth... Mohon tunggu.</i>', threadId ? { message_thread_id: threadId } : {});
+    } else {
+      await sendRich(chatId, '❌ Gagal mengirimkan kode otorisasi ke proses login. Silakan coba lagi atau ketik /cancel.', threadId ? { message_thread_id: threadId } : {});
+    }
+    return;
+  }
+
   // File Upload Handling
   if (msg.document || msg.photo) {
     sendChatAction(chatId, 'upload_document').catch(() => {});
@@ -3479,24 +3594,19 @@ async function handleMessage(msg) {
       const arrayBuffer = await resStream.arrayBuffer();
       fs.writeFileSync(tempAudioPath, Buffer.from(arrayBuffer));
 
-      // Transkripsi via transcribe.py
-      const transcribeScript = path.join(__dirname, 'transcribe.py');
-      const out = execSync(`python3 "${transcribeScript}" "${tempAudioPath}"`, {
-        timeout: 30000,
-        encoding: 'utf8'
-      });
+      // Transkripsi via processVoiceNote (async)
+      const sttRes = await processVoiceNote(tempAudioPath);
       try { fs.unlinkSync(tempAudioPath); } catch (_) {}
 
-      const parsed = JSON.parse(out);
-      if (!parsed.success || !parsed.text) {
+      if (!sttRes.success || !sttRes.text) {
         if (progressMsg) {
           await tgRequest('deleteMessage', { chat_id: chatId, message_id: progressMsg.message_id }).catch(() => {});
         }
-        await sendRich(chatId, `⚠️ <b>Gagal mengenali suara:</b> ${parsed.error || 'Pesan suara tidak terdeteksi jelas.'}`);
+        await sendRich(chatId, `⚠️ <b>Gagal mengenali suara:</b> ${sttRes.error || 'Pesan suara tidak terdeteksi jelas.'}`);
         return;
       }
 
-      const transcribedText = parsed.text.trim();
+      const transcribedText = sttRes.text.trim();
       if (progressMsg) {
         await tgRequest('deleteMessage', { chat_id: chatId, message_id: progressMsg.message_id }).catch(() => {});
       }
@@ -3624,6 +3734,77 @@ async function handleMessage(msg) {
   if (text === '/agusage') {
     const view = buildAgUsageView();
     await sendRich(chatId, view.doc, { reply_markup: view.keyboard });
+    return;
+  }
+
+  // 0.5b /agswitch [slot]
+  if (text === '/agswitch' || text.startsWith('/agswitch ')) {
+    const arg = text.slice(9).trim();
+    if (!arg) {
+      const ag = getAgyAccountsUsage();
+      const activeSlot = ag ? ag.activeSlot : '1';
+      const view = buildSlotSelectorView(activeSlot);
+      await sendRich(chatId, view.doc, { reply_markup: view.keyboard });
+      return;
+    }
+    const switchRes = await switchToSlot(arg);
+    await sendRich(chatId, switchRes.message);
+    return;
+  }
+
+  // 0.5c /aglogin <slot>
+  if (text === '/aglogin' || text.startsWith('/aglogin ')) {
+    const slotArg = text.slice(8).trim();
+    if (!slotArg) {
+      await sendRich(chatId, 'ℹ️ Harap tentukan nomor slot yang ingin di-login:\nContoh: <code>/aglogin 7</code>');
+      return;
+    }
+
+    await sendRich(chatId, `⏳ <i>Menyiapkan sesi login Google OAuth untuk Slot ${escapeHtml(slotArg)}...</i>`);
+
+    await startLoginFlow(chatId, slotArg, {
+      onUrlReady: async (oauthUrl, slot) => {
+        const loginText =
+          `🔗 <b>Login Google Auth — Slot ${slot}</b>\n\n` +
+          `1. Klik link di bawah untuk login dengan Akun Google Anda:\n` +
+          `👉 <a href="${oauthUrl}">Buka Halaman Login Google</a>\n\n` +
+          `2. Setelah berhasil login, copy <b>Authorization Code</b> atau <b>URL redirect</b> (https://antigravity.google/...).\n\n` +
+          `3. Kirimkan kode atau URL tersebut ke chat ini!\n\n` +
+          `<i>Ketik /cancel untuk membatalkan sesi.</i>`;
+        await sendRich(chatId, loginText);
+      },
+      onComplete: async (result) => {
+        await sendRich(chatId, result.message);
+      }
+    });
+    return;
+  }
+
+  // 0.5d /git [status|diff|push|pull]
+  if (text === '/git' || text.startsWith('/git ')) {
+    const subCmd = text.slice(4).trim();
+    if (subCmd === 'diff') {
+      const diffRes = await getGitDiff();
+      await sendRich(chatId, diffRes.text);
+      return;
+    }
+    if (subCmd.startsWith('push')) {
+      const customMsg = subCmd.slice(4).trim();
+      await sendRich(chatId, '🚀 <i>Melakukan commit dan push ke origin/main...</i>');
+      const pushRes = await gitCommitAndPush(customMsg);
+      await sendRich(chatId, pushRes.message);
+      return;
+    }
+    if (subCmd === 'pull') {
+      await sendRich(chatId, '⬇️ <i>Menarik update terbaru dari GitHub...</i>');
+      const pullRes = await gitPull();
+      await sendRich(chatId, pullRes.message);
+      return;
+    }
+
+    // Default: git status view
+    const statusRes = await getGitStatus();
+    await sendRich(chatId, statusRes.text, { reply_markup: statusRes.keyboard });
     return;
   }
 
@@ -4696,6 +4877,9 @@ async function registerCommands() {
     { command: 'usage', description: 'Ringkasan statistik penggunaan AI' },
     { command: '9usage', description: 'Detail statistik token 9Router' },
     { command: 'agusage', description: 'Status 14 akun Google Auth AGY' },
+    { command: 'agswitch', description: 'Pindah slot akun Google Auth' },
+    { command: 'aglogin', description: 'Login / perbarui token Google Auth' },
+    { command: 'git', description: 'Hub kontrol Git (status, diff, push)' },
     { command: 'preview', description: 'Screenshot web / port lokal' },
     { command: 'voice', description: 'Toggle mode balasan suara (Podcast)' },
     { command: 'cat', description: 'Baca file kode langsung di chat' },
