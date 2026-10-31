@@ -110,7 +110,7 @@ async function runPhase4Tests() {
 
   const tempAudio = path.join(os.tmpdir(), `test_stt_input_${Date.now()}.mp3`);
   try {
-    execSync(`edge-tts --text "cek status server" --write-media "${tempAudio}"`, { stdio: 'ignore' });
+    execSync(`edge-tts --text "selamat pagi dunia" --write-media "${tempAudio}"`, { stdio: 'ignore' });
   } catch (_) {}
 
   if (fs.existsSync(tempAudio)) {
@@ -120,7 +120,7 @@ async function runPhase4Tests() {
 
     // Test 09: Transcribed text accuracy
     assert(
-      sttResult.text && sttResult.text.toLowerCase().includes('status'),
+      sttResult.text && sttResult.text.toLowerCase().includes('pagi'),
       `Transcribed text matches audio content ("${sttResult.text}")`
     );
 
