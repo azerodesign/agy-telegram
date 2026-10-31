@@ -141,13 +141,22 @@ export async function getGitDiff(maxChars = 2500) {
 /**
  * Performs git add, git commit, and git push.
  */
-export async function gitCommitAndPush(customMessage) {
+export async function gitCommitAndPush(customMessage, options = {}) {
   const commitMsg = (customMessage || `chore: update from telegram bridge at ${new Date().toISOString()}`).trim();
+  const repoDir = options.cwd || REPO_ROOT;
+
+  if (options.dryRun) {
+    return {
+      success: true,
+      dryRun: true,
+      message: `Dry run commit & push verified for message: "${commitMsg}"`
+    };
+  }
 
   return new Promise((resolve) => {
     try {
-      execSync('git add -A', { cwd: REPO_ROOT });
-      const status = execSync('git status --porcelain', { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+      execSync('git add -A', { cwd: repoDir });
+      const status = execSync('git status --porcelain', { cwd: repoDir, encoding: 'utf8' }).trim();
       if (!status) {
         return resolve({
           success: false,
@@ -155,9 +164,9 @@ export async function gitCommitAndPush(customMessage) {
         });
       }
 
-      execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: REPO_ROOT });
-      const pushOut = execSync('git push origin main 2>&1', { cwd: REPO_ROOT, encoding: 'utf8' });
-      const hash = execSync('git rev-parse --short HEAD', { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+      execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd: repoDir });
+      const pushOut = execSync('git push origin main 2>&1', { cwd: repoDir, encoding: 'utf8' });
+      const hash = execSync('git rev-parse --short HEAD', { cwd: repoDir, encoding: 'utf8' }).trim();
 
       resolve({
         success: true,

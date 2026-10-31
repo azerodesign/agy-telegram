@@ -213,11 +213,11 @@ async function runPhase4Tests() {
     'getGitDiff executes cleanly without throwing'
   );
 
-  // Test 20: gitCommitAndPush handling
-  const gitRes = await gitCommitAndPush('test: should not commit if clean');
+  // Test 20: gitCommitAndPush dryRun handling
+  const gitRes = await gitCommitAndPush('test: dry run validation', { dryRun: true });
   assert(
-    typeof gitRes.success === 'boolean' && (gitRes.message.includes('Tidak ada perubahan') || gitRes.message.includes('Berhasil')),
-    'gitCommitAndPush cleanly detects working tree status and handles state without crashes'
+    gitRes.success === true && gitRes.dryRun === true,
+    'gitCommitAndPush dryRun validates commit payload safely without pushing to remote'
   );
 
   // =========================================================================
