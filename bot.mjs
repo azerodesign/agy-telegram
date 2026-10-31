@@ -4,6 +4,13 @@ import { spawn, exec, execFile, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { DatabaseSync } from 'node:sqlite';
 import * as tgRich from 'tg-rich-messages';
+import {
+  buildAgUsageView as buildAgUsageRichView,
+  buildUsageOverviewSection,
+  triggerManualRefresh,
+  formatProgressText
+} from './src/usage/ui.mjs';
+import { loadCache, DEFAULT_CACHE_PATH, DEFAULT_CACHE_TTL_MS } from './src/usage/scanner.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2214,13 +2221,10 @@ function buildUsageView() {
   }
 
   if (ag) {
+    const cacheResult = loadCache(DEFAULT_CACHE_PATH, DEFAULT_CACHE_TTL_MS);
     blocks.push(
       tgRich.heading(3, '🔑 AGY Google Multi-Auth:'),
-      tgRich.table([
-        [{ content: 'Total Akun Google' }, { content: `${ag.total} akun (${ag.proCount} PRO)` }],
-        [{ content: 'Slot Aktif' }, { content: `Slot ${ag.activeSlot} 🟢` }],
-        [{ content: 'Status Rotasi' }, { content: `${ag.rotations}x putaran` }]
-      ], { bordered: true })
+      buildUsageOverviewSection(cacheResult, ag)
     );
   }
 
@@ -2286,48 +2290,9 @@ function build9UsageView() {
 
 function buildAgUsageView() {
   const ag = getAgyAccountsUsage();
-  if (!ag) {
-    return {
-      doc: tgRich.doc(tgRich.paragraph('❌ <i>Data akun Google Auth AGY tidak ditemukan.</i>')),
-      keyboard: { inline_keyboard: [[{ text: '« Kembali', callback_data: 'view:usage' }]] }
-    };
-  }
-
-  const tableRows = [
-    [{ content: 'Slot', header: true }, { content: 'Email Akun', header: true }, { content: 'Plan', header: true }]
-  ];
-  for (const a of ag.accounts) {
-    const marker = a.isActive ? ' 🟢' : '';
-    tableRows.push([
-      { content: `${a.slot}${marker}` },
-      { content: tgRich.code(a.email) },
-      { content: tgRich.bold(a.plan) }
-    ]);
-  }
-
-  const doc = tgRich.doc(
-    tgRich.heading(2, '🔑 AGY Google Auth Accounts (14 Akun)'),
-    tgRich.paragraph([
-      `Total Akun: <b>${ag.total}</b> (`,
-      tgRich.bold(`${ag.proCount} PRO`),
-      ` | <b>${ag.freeCount} FREE</b>)\n`,
-      `Slot Aktif Saat Ini: <b>Slot ${ag.activeSlot}</b> 🟢\n`,
-      `Total Rotasi Round-Robin: <b>${ag.rotations}x</b>\n`,
-      `Rotasi Terakhir: <code>${ag.lastRotated ? formatTime(ag.lastRotated) : '-'}</code>`
-    ]),
-    tgRich.table(tableRows, { bordered: true }),
-    tgRich.blockquote('🟢 Menandakan slot akun yang saat ini aktif digunakan oleh Antigravity.')
-  );
-
-  return {
-    doc,
-    keyboard: {
-      inline_keyboard: [
-        [{ text: '🌐 Detail 9Router (/9usage)', callback_data: 'view:9usage' }],
-        [{ text: '« Ringkasan (/usage)', callback_data: 'view:usage' }]
-      ]
-    }
-  };
+  return buildAgUsageRichView({
+    activeSlot: ag ? ag.activeSlot : '1'
+  });
 }
 
 function buildDashboardView(session, userId) {
@@ -2587,8 +2552,20 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
                   startTime: Date.now()
                 };
                 executedTools.push(entry);
-                if (onProgress) onProgress({ event: 'tool_start', tool: entry, tools: executedTools });
+                if (onProgress) onProgress({
+                  event: 'tool_start',
+                  tool: entry,
+                  tools: executedTools,
+                  lastLog: `Menjalankan ${toolName}...`
+                });
               } else if (su.state === 'DONE') {
+                let outputSnippet = null;
+                if (su.tool_info?.output) {
+                  const outStr = typeof su.tool_info.output === 'string'
+                    ? su.tool_info.output
+                    : JSON.stringify(su.tool_info.output);
+                  outputSnippet = outStr.trim().split('\n')[0].slice(0, 80);
+                }
                 const last = executedTools.slice().reverse().find(t => t.name === toolName && t.status === 'running');
                 if (last) {
                   last.status = 'done';
@@ -2604,10 +2581,21 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
                     startTime: Date.now()
                   });
                 }
-                if (onProgress) onProgress({ event: 'tool_done', tools: executedTools });
+                if (onProgress) onProgress({
+                  event: 'tool_done',
+                  tool: last || executedTools[executedTools.length - 1],
+                  tools: executedTools,
+                  lastLog: outputSnippet || `Selesai ${toolName}`
+                });
               }
             } else if (su.step_type === 'agent_response') {
-              if (onProgress) onProgress({ event: 'thinking', tools: executedTools });
+              const thoughtText = su.content || su.text || su.thought || '';
+              if (onProgress) onProgress({
+                event: 'thinking',
+                text: thoughtText,
+                tools: executedTools,
+                lastLog: thoughtText ? (thoughtText.length > 100 ? thoughtText.slice(0, 100) + '…' : thoughtText) : null
+              });
             }
           } else if (ev === 'result') {
             finalResult = data.result;
@@ -2616,11 +2604,36 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
               saveSessions();
             }
           }
-        } catch (_) {}
+        } catch (_) {
+          const trimmed = line.trim();
+          if (trimmed && onProgress) {
+            onProgress({
+              event: 'log',
+              text: trimmed,
+              tools: executedTools,
+              lastLog: trimmed
+            });
+          }
+        }
       }
     });
 
-    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.stderr.on('data', d => {
+      const str = d.toString();
+      stderr += str;
+      const errLines = str.trim().split('\n').filter(Boolean);
+      if (errLines.length > 0 && onProgress) {
+        const lastLine = errLines[errLines.length - 1].trim();
+        if (lastLine) {
+          onProgress({
+            event: 'stderr',
+            text: lastLine,
+            tools: executedTools,
+            lastLog: lastLine
+          });
+        }
+      }
+    });
 
     child.on('close', code => {
       if (stdoutBuffer && stdoutBuffer.trim()) {
@@ -2994,47 +3007,43 @@ async function handleCallback(cb) {
 
   // 1.4 View AGY Accounts Detail
   if (data === 'view:agusage') {
-    const ag = getAgyAccountsUsage();
-    if (!ag) {
-      await answerCallbackQuery(queryId, 'Data akun AGY kosong.', true);
+    const view = buildAgUsageView();
+    await editRich(chatId, messageId, view.doc, {
+      reply_markup: view.keyboard
+    });
+    await answerCallbackQuery(queryId);
+    return;
+  }
+
+  // 1.4b Refresh AGY Quota Cache
+  if (data === 'action:refresh_agusage') {
+    const refreshResult = await triggerManualRefresh();
+    if (!refreshResult.success) {
+      await answerCallbackQuery(queryId, refreshResult.message, true);
       return;
     }
 
-    const tableRows = [
-      [{ content: 'Slot', header: true }, { content: 'Email Akun', header: true }, { content: 'Plan', header: true }]
-    ];
-    for (const a of ag.accounts) {
-      const marker = a.isActive ? ' 🟢' : '';
-      tableRows.push([
-        { content: `${a.slot}${marker}` },
-        { content: tgRich.code(a.email) },
-        { content: tgRich.bold(a.plan) }
-      ]);
-    }
+    await answerCallbackQuery(queryId, '🔄 Memulai pemindaian 14 akun...');
+    await editRich(chatId, messageId, tgRich.doc(
+      tgRich.heading(2, '🔑 AGY Google Multi-Auth Quota Monitor'),
+      tgRich.paragraph('🔄 <i>Sedang memindai kuota 14 akun Google Auth di background (~45s)...</i>\n\nPesan ini akan diperbarui otomatis begitu pemindaian selesai.'),
+      tgRich.blockquote('Proses berjalan di sandbox terisolasi tanpa memutus sesi bot yang aktif.')
+    ));
 
-    const richDoc = tgRich.doc(
-      tgRich.heading(2, '🔑 AGY Google Auth (14 Akun)'),
-      tgRich.paragraph([
-        `Total Akun: <b>${ag.total}</b> (`,
-        tgRich.bold(`${ag.proCount} PRO`),
-        ` | <b>${ag.freeCount} FREE</b>)\n`,
-        `Slot Aktif: <b>Slot ${ag.activeSlot}</b> 🟢\n`,
-        `Total Rotasi: <b>${ag.rotations}x</b>\n`,
-        `Rotasi Terakhir: <code>${ag.lastRotated ? formatTime(ag.lastRotated) : '-'}</code>`
-      ]),
-      tgRich.table(tableRows, { bordered: true }),
-      tgRich.blockquote('🟢 Menandakan slot akun yang saat ini aktif digunakan oleh Antigravity.')
-    );
-
-    await editRich(chatId, messageId, richDoc, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '🌐 Lihat 9Router', callback_data: 'view:9usage' }],
-          [{ text: '« Ringkasan Usage', callback_data: 'view:usage' }]
-        ]
+    // When background scan finishes, update message with fresh data
+    let pollCount = 0;
+    const checkTimer = setInterval(async () => {
+      pollCount++;
+      const { getIsScanActive } = await import('./src/usage/ui.mjs');
+      if (!getIsScanActive() || pollCount > 60) {
+        clearInterval(checkTimer);
+        const updatedView = buildAgUsageView();
+        await editRich(chatId, messageId, updatedView.doc, {
+          reply_markup: updatedView.keyboard
+        }).catch(() => {});
       }
-    });
-    await answerCallbackQuery(queryId);
+    }, 2000);
+    if (checkTimer.unref) checkTimer.unref();
     return;
   }
 
@@ -3550,6 +3559,50 @@ async function handleMessage(msg) {
   if (text === '/topic') {
     const isTopicAllowed = threadId && ALLOWED_TOPICS.includes(threadId);
     await sendRich(chatId, `🏷️ <b>Informasi Topik & Router:</b>\n• Chat ID: <code>${chatId}</code>\n• Topic ID: <code>${threadId || 'General'}</code>\n• Allowed Topics: <code>${ALLOWED_TOPICS.join(', ')}</code>\n• Agent: <b>Antigravity CLI (AGY)</b>\n• Status: ${isTopicAllowed ? '✅ <b>Dedicated Topic Aktif</b>' : (isGroup ? '⚠️ Topik Tidak Terdaftar' : '💬 Private Chat')}`);
+    return;
+  }
+
+  // 0.2b /restart (Reboot Service with Shutdown & Recovery Notification)
+  if (text === '/restart') {
+    const threadOpt = threadId ? { message_thread_id: threadId } : {};
+    let shutdownMsg = null;
+    try {
+      shutdownMsg = await tgRequest('sendMessage', {
+        chat_id: chatId,
+        text: '🔄 <b>Memulai Restart AGY Telegram Bridge...</b>\n\n⏳ <i>Menyimpan state & memicu systemctl restart...</i>\nPesan notifikasi akan diperbarui otomatis begitu bot aktif kembali.',
+        parse_mode: 'HTML',
+        ...threadOpt
+      });
+    } catch (_) {}
+
+    const restartState = {
+      chatId,
+      threadId: threadId || null,
+      messageId: shutdownMsg?.message_id || null,
+      requestedAt: Date.now(),
+      requestedBy: msg.from?.username ? `@${msg.from.username}` : (msg.from?.first_name || 'User')
+    };
+
+    try {
+      fs.writeFileSync('/tmp/agy_restart_state.json', JSON.stringify(restartState, null, 2), { mode: 0o600 });
+    } catch (e) {
+      console.error('[RESTART] Failed to save restart state:', e.message);
+    }
+
+    // Cancel running active AGY processes
+    for (const [key, proc] of activeProcesses.entries()) {
+      try { if (proc.cancel) proc.cancel(); } catch (_) {}
+    }
+
+    console.log(`[RESTART] Triggered by ${restartState.requestedBy} from chat ${chatId}`);
+    setTimeout(() => {
+      const child = spawn('sudo', ['systemctl', 'restart', 'agy-telegram.service'], {
+        detached: true,
+        stdio: 'ignore'
+      });
+      child.unref();
+    }, 500);
+
     return;
   }
 
@@ -4313,6 +4366,7 @@ async function handleMessage(msg) {
   let lastSentBodyText = '';
   let pendingUpdate = null;
   let progressCooldownUntil = 0;
+  const PROGRESS_THROTTLE_MS = 1500;
 
   const flushProgressUpdate = async () => {
     if (!progressMsg || isUpdatingProgress) return;
@@ -4322,25 +4376,7 @@ async function handleMessage(msg) {
 
     const update = pendingUpdate;
     pendingUpdate = null;
-    const tools = update.tools || [];
-    if (tools.length === 0) return;
-
-    const recent = tools.slice(-4);
-    const lines = recent.map((t) => {
-      const icon = t.status === 'running' ? '⚙️' : '✅';
-      let detail = '';
-      if (t.name === 'run_command') {
-        let cmd = cleanParam(t.params?.CommandLine || t.parameters?.CommandLine || '');
-        detail = `: <code>${escapeHtml(String(cmd).slice(0, 36))}</code>`;
-      } else if (t.name === 'edit_file' || t.name === 'write_file' || t.name === 'read_file') {
-        let p = cleanParam(t.params?.Path || t.parameters?.Path || '');
-        detail = `: <code>${escapeHtml(path.basename(String(p || '')))}</code>`;
-      }
-      const dur = t.duration ? ` <i>(${t.duration}s)</i>` : '';
-      return `${icon} <b>${t.name}</b>${detail}${dur}`;
-    });
-
-    const bodyText = `⏳ <b>AGY Sedang Bekerja...</b>\n\n${lines.join('\n')}\n\n<i>Total ${tools.length} aksi dijalankan</i>`;
+    const bodyText = formatProgressText(update);
     if (bodyText === lastSentBodyText) return;
 
     isUpdatingProgress = true;
@@ -4367,7 +4403,7 @@ async function handleMessage(msg) {
       isUpdatingProgress = false;
       if (pendingUpdate && !scheduledProgressTimer) {
         const elapsed = Date.now() - lastProgressTime;
-        const delay = Math.max(0, 2500 - elapsed);
+        const delay = Math.max(0, PROGRESS_THROTTLE_MS - elapsed);
         scheduledProgressTimer = setTimeout(() => {
           scheduledProgressTimer = null;
           flushProgressUpdate();
@@ -4383,7 +4419,7 @@ async function handleMessage(msg) {
     const now = Date.now();
     if (now < progressCooldownUntil) return;
 
-    if (!isUpdatingProgress && (now - lastProgressTime >= 2500)) {
+    if (!isUpdatingProgress && (now - lastProgressTime >= PROGRESS_THROTTLE_MS)) {
       if (scheduledProgressTimer) {
         clearTimeout(scheduledProgressTimer);
         scheduledProgressTimer = null;
@@ -4391,7 +4427,7 @@ async function handleMessage(msg) {
       flushProgressUpdate();
     } else if (!scheduledProgressTimer) {
       const elapsed = now - lastProgressTime;
-      const delay = Math.max(0, 2500 - elapsed);
+      const delay = Math.max(0, PROGRESS_THROTTLE_MS - elapsed);
       scheduledProgressTimer = setTimeout(() => {
         scheduledProgressTimer = null;
         flushProgressUpdate();
@@ -4667,6 +4703,7 @@ async function registerCommands() {
     { command: 'tree', description: 'Struktur hierarki folder' },
     { command: 'watch', description: 'Monitor service/port di background' },
     { command: 'stop', description: 'Hentikan proses AGY yang berjalan' },
+    { command: 'restart', description: 'Reboot service AGY Telegram Bridge' },
     { command: 'keyboard', description: 'Tampilkan tombol pintas HP' },
     { command: 'topic', description: 'Informasi topik grup aktif' },
     { command: 'resume', description: 'Lanjutkan sesi obrolan sebelumnya' },
@@ -4691,6 +4728,58 @@ async function registerCommands() {
   }
 }
 
+async function checkAndNotifyRestartRecovery() {
+  const restartFile = '/tmp/agy_restart_state.json';
+  if (!fs.existsSync(restartFile)) return;
+
+  try {
+    const raw = fs.readFileSync(restartFile, 'utf8');
+    const state = JSON.parse(raw);
+    try { fs.unlinkSync(restartFile); } catch (_) {}
+
+    const elapsedSec = ((Date.now() - (state.requestedAt || Date.now())) / 1000).toFixed(1);
+    const text =
+      '🚀 <b>AGY Telegram Bridge Berhasil Di-restart!</b>\n\n' +
+      `• <b>Durasi Reboot:</b> <code>${elapsedSec}s</code>\n` +
+      `• <b>PID Baru:</b> <code>${process.pid}</code>\n` +
+      `• <b>Diminta Oleh:</b> ${escapeHtml(state.requestedBy || 'Admin')}\n` +
+      `• <b>Waktu:</b> <code>${new Date().toISOString().slice(11, 19)} UTC</code>\n\n` +
+      '<i>Semua sistem siap menerima instruksi.</i>';
+
+    const opts = state.threadId ? { message_thread_id: state.threadId } : {};
+
+    if (state.messageId) {
+      try {
+        await tgRequest('editMessageText', {
+          chat_id: state.chatId,
+          message_id: state.messageId,
+          text,
+          parse_mode: 'HTML'
+        });
+        return;
+      } catch (_) {}
+    }
+
+    await sendRich(state.chatId, text, opts);
+  } catch (err) {
+    console.error('[RECOVERY] Failed to send restart recovery message:', err.message);
+  }
+}
+
+let isShuttingDown = false;
+const handleGracefulShutdown = (signal) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`[SHUTDOWN] Received ${signal}. Performing graceful shutdown...`);
+  for (const [key, proc] of activeProcesses.entries()) {
+    try { if (proc.cancel) proc.cancel(); } catch (_) {}
+  }
+  process.exit(0);
+};
+
+process.on('SIGINT', () => handleGracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => handleGracefulShutdown('SIGTERM'));
+
 let isPollingActive = false;
 
 async function startPolling() {
@@ -4707,6 +4796,7 @@ async function startPolling() {
     const me = await tgRequest('getMe');
     console.log(`Connected successfully as @${me.username} (${me.first_name})`);
     await registerCommands();
+    await checkAndNotifyRestartRecovery();
   } catch (err) {
     console.error('Failed to connect to Telegram with provided token:', err.message);
     process.exit(1);
