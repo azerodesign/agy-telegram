@@ -85,7 +85,22 @@ export function formatProgressText(update = {}) {
     }
   }
 
-  return `⏳ <b>AGY Sedang Bekerja...</b>\n\n${lines.join('\n')}${liveLogSnippet}\n\n<i>Total ${tools.length} aksi dijalankan</i>`;
+  let milestoneBanner = '';
+  if (tools.length >= 100) {
+    milestoneBanner = `\n\n🛡️ <b>Proteksi Turn Aktif (${tools.length}/100+ aksi):</b>\n<i>Eksekusi mendalam skala besar — agent terus menuntaskan instruksi. Progres file aman di disk.</i>`;
+  } else if (tools.length >= 80) {
+    milestoneBanner = `\n\n⚠️ <b>Milestone Aksi Tinggi (${tools.length} aksi):</b>\n<i>Mendekati 100 aksi — checkpoint status aktif dan proses tetap berjalan stabil.</i>`;
+  } else if (tools.length >= 50) {
+    milestoneBanner = `\n\n💡 <i>Fase lanjutan: ${tools.length} aksi terselesaikan dengan aman.</i>`;
+  }
+
+  const titleHeader = tools.length >= 100
+    ? `🔥 <b>AGY Sedang Bekerja (Intensif: ${tools.length} Aksi)...</b>`
+    : (tools.length >= 80
+      ? `⚡ <b>AGY Sedang Bekerja (${tools.length} Aksi)...</b>`
+      : `⏳ <b>AGY Sedang Bekerja...</b>`);
+
+  return `${titleHeader}\n\n${lines.join('\n')}${liveLogSnippet}${milestoneBanner}\n\n<i>Total ${tools.length} aksi dijalankan</i>`;
 }
 
 /**

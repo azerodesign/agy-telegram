@@ -130,11 +130,13 @@ Bot akan otomatis berjalan di background dan otomatis restart bila server reboot
 - **Real-time Code Execution & Logs**:
   - Live progress update saat agent mengeksekusi kode, bash command, manipulasi file, hingga instruksi berbasis foto/screenshot.
   - Tombol interaktif `📜 Logs Kode` di bawah setiap respons untuk melihat detail command, parameter, syntax highlighting, dan exit output.
-  - Hub Log terpusat `/logs` untuk meninjau log kode terakhir, riwayat sesi, dan service systemd bot.
+  - Hub Log terpusat `/logs` untuk meninjau status monitor agent aktif (menghitung jumlah proses yang sedang berjalan), log kode turn terakhir, riwayat sesi, dan service systemd bot.
+  - Proteksi Action Cap (≥ 100 tool executions): Ketika sebuah task mencapai milestone aksi tinggi atau mendekati 100 aksi, bot menampilkan badge proteksi, menyimpan checkpoint berkala, dan menjamin laporan eksekusi tidak hilang/menghilang tiba-tiba.
 - **Smart Multi-Auth & Quota Management**:
   - `/agusage`: Visualisasi progress bar kuota 14 akun Google Auth AGY.
   - `/agswitch [slot]`: Berpindah slot akun aktif secara manual atau interaktif via inline keyboard.
   - `/aglogin <slot>`: Wizard login OAuth Google langsung via chat Telegram.
+  - `/aglogin validate [path]`: Validasi file JSON akun bulk di isolated sandbox, cek validitas token/kuota (PRO/FREE), dan import otomatis 1-klik ke slot 1-14 dengan backup otomatis (`backup_previous.json`).
 - **Git Operations Hub**:
   - `/git` untuk inspeksi branch, status perubahan, git diff visual, commit, dan push langsung dari Telegram.
 - **Resume & Riwayat Percakapan**: Melanjutkan sesi obrolan sebelumnya melalui menu interaktif atau perintah langsung `/resume <nomor|ID|kata kunci>`.
@@ -154,14 +156,14 @@ Bot akan otomatis berjalan di background dan otomatis restart bila server reboot
 | `/bgtask <task>` | Jalankan perintah/tugas berat secara mandiri di latar belakang |
 | `/agusage` | Cek kuota visual & status 14 slot akun Google Auth |
 | `/agswitch [slot]` | Pindah slot akun aktif (inline keyboard atau nomor slot) |
-| `/aglogin <slot>` | Wizard login/perpanjang token Google OAuth via chat |
+| `/aglogin [slot\|validate [file]]` | Wizard login OAuth manual per-slot atau validasi & import file JSON akun bulk |
 | `/git [status\|diff\|push\|pull]` | Hub manajemen git repository dari Telegram |
 | `/model` | Keyboard visual pemilihan model AI |
 | `/models` | Daftar lengkap model yang tersedia |
 | `/effort` | Atur intensitas penalaran (Low/Med/High/Max) |
 | `/mode` | Atur mode kerja agent (Auto/Plan/Accept-Edits) |
 | `/resume [id]` | Lanjutkan sesi percakapan sebelumnya (menu visual / nomor / ID / keyword) |
-| `/logs [code\|conv\|bot]` | Hub & viewer log eksekusi kode, tool, dan systemd service |
+| `/logs [agent\|code\|conv\|bot]` | Hub & viewer monitor agent berjalan, log kode, transcript, dan service |
 | `/get <file>` | Download file server ke chat Telegram |
 | `/sh <cmd>` | Eksekusi shell terminal langsung |
 | `/ls` | Lihat daftar file di folder server aktif |

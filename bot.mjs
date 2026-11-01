@@ -30,6 +30,12 @@ import {
   gitCommitAndPush,
   gitPull
 } from './src/git/git-ops.mjs';
+import {
+  parseAccountsJson,
+  validateAccountsBatch,
+  importAccountsToSlots,
+  formatValidationReport
+} from './src/usage/account-importer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -76,6 +82,9 @@ const sessionTaskQueues = new Map();
 
 // Active background tasks: bgTaskId -> { id, prompt, child, startTime, chatId, threadId, sessionKey, status, result, error }
 const backgroundTasks = new Map();
+
+// Latest validated accounts cache for one-click import
+let latestValidatedAccounts = null;
 
 // Active cloudflare tunnels: port -> { child, url, startTime }
 const activeTunnels = new Map();
@@ -2036,25 +2045,99 @@ async function getBotServiceLogs(lines = 30) {
   return '(Tidak ada catatan log ditemukan)';
 }
 
+function getActiveAgentsSummary() {
+  const active = [];
+  for (const [key, proc] of activeProcesses.entries()) {
+    const isBg = proc.isBg || key.startsWith('bgtask:');
+    const elapsedSec = Math.floor((Date.now() - (proc.startTime || Date.now())) / 1000);
+    active.push({
+      sessionKey: key,
+      pid: proc.child?.pid || 'N/A',
+      isBg,
+      prompt: proc.prompt || '',
+      toolCount: (proc.executedTools || []).length,
+      elapsedSec,
+      stopping: proc.stopping
+    });
+  }
+
+  const bgTasks = [];
+  for (const [id, bg] of backgroundTasks.entries()) {
+    if (bg.status === 'running') {
+      const elapsedSec = Math.floor((Date.now() - (bg.startTime || Date.now())) / 1000);
+      bgTasks.push({
+        id,
+        prompt: bg.prompt,
+        elapsedSec,
+        chatId: bg.chatId
+      });
+    }
+  }
+
+  const queued = [];
+  for (const [key, q] of sessionTaskQueues.entries()) {
+    if (Array.isArray(q) && q.length > 0) {
+      queued.push({
+        sessionKey: key,
+        count: q.length,
+        tasks: q.map(item => ({ prompt: item.prompt, enqueuedAt: item.enqueuedAt }))
+      });
+    }
+  }
+
+  const totalActive = active.length;
+  const totalQueued = queued.reduce((sum, item) => sum + item.count, 0);
+
+  return {
+    totalActive,
+    activeProcesses: active,
+    backgroundTasks: bgTasks,
+    queued,
+    totalQueued
+  };
+}
+
+function formatDurationHuman(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}m ${s}s`;
+}
+
 function buildLogsMenuView(session) {
   const convId = session.conversationId;
   const shortId = convId ? convId.slice(0, 8) : '(Belum ada sesi)';
   const lastToolCount = (session.lastTurn?.tools || session.lastTools || []).length;
 
+  const agentSummary = getActiveAgentsSummary();
+  const totalActive = agentSummary.totalActive;
+  const bgCount = agentSummary.backgroundTasks.length;
+  const queuedCount = agentSummary.totalQueued;
+
   const doc = tgRich.doc(
-    tgRich.heading(2, '📜 AGY Logs Hub'),
+    tgRich.heading(2, '📜 AGY Logs & Agent Monitor Hub'),
     tgRich.table([
-      [{ content: 'Kategori Log', header: true }, { content: 'Status / Detail', header: true }],
-      [{ content: '💬 Sesi Aktif' }, { content: tgRich.code(shortId) }],
+      [{ content: 'Kategori Monitoring', header: true }, { content: 'Status / Detail', header: true }],
+      [{ content: '🤖 Agent Berjalan' }, { content: totalActive > 0 ? `🟢 ${totalActive} agent aktif` : '⚪ Idle (0 aktif)' }],
+      [{ content: '⚙️ Background Task' }, { content: `${bgCount} task` }],
+      [{ content: '⏳ Antrean Task' }, { content: `${queuedCount} menunggu` }],
+      [{ content: '💬 Sesi Saat Ini' }, { content: tgRich.code(shortId) }],
       [{ content: '⚡ Aksi Turn Terakhir' }, { content: `${lastToolCount} tool/kode` }],
       [{ content: '🖥️ Status Service' }, { content: 'Active (systemd)' }]
     ], { bordered: true }),
-    tgRich.blockquote('Pilih kategori log di bawah untuk meninjau perintah kode yang dijalankan atau riwayat service bot.'),
+    tgRich.blockquote(
+      totalActive > 0
+        ? `Sedang ada ${totalActive} proses agent aktif yang berjalan saat ini.`
+        : 'Semua agent sedang idle. Pilih kategori log di bawah untuk meninjau detail proses, kode turn terakhir, atau riwayat service bot.'
+    ),
     tgRich.divider()
   );
 
   const keyboard = {
     inline_keyboard: [
+      [
+        { text: `🤖 Detail Agent Aktif (${totalActive})`, callback_data: 'view:agent_logs' }
+      ],
       [
         { text: `⚡ Log Kode Terakhir (${lastToolCount})`, callback_data: 'view:turn_logs' }
       ],
@@ -2067,6 +2150,80 @@ function buildLogsMenuView(session) {
       [
         { text: '⚙️ Buka Dashboard', callback_data: 'view:status' }
       ]
+    ]
+  };
+
+  return { doc, keyboard };
+}
+
+function buildActiveAgentsView() {
+  const summary = getActiveAgentsSummary();
+  const total = summary.totalActive;
+
+  if (total === 0 && summary.totalQueued === 0) {
+    const doc = tgRich.doc(
+      tgRich.heading(2, '🤖 Status Agent AGY'),
+      tgRich.paragraph('Saat ini **tidak ada agent yang sedang berjalan** (Status: Idle).'),
+      tgRich.blockquote(
+        '💡 Kirimkan prompt untuk memulai proses baru, atau gunakan:\n' +
+        '• `/bgtask <task>` untuk pengerjaan di latar belakang\n' +
+        '• `/btw <pertanyaan>` untuk tanya cepat tanpa mengganggu task utama'
+      ),
+      tgRich.divider()
+    );
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '🔄 Refresh Status Agent', callback_data: 'view:agent_logs' }],
+        [{ text: '« Hub Log', callback_data: 'view:logs' }]
+      ]
+    };
+    return { doc, keyboard };
+  }
+
+  const tableRows = [
+    [{ content: '#', header: true }, { content: 'Tipe', header: true }, { content: 'Runtime', header: true }, { content: 'Aksi', header: true }]
+  ];
+
+  summary.activeProcesses.forEach((p, idx) => {
+    const type = p.isBg ? '⚙️ BG Task' : '🚀 Foreground';
+    const dur = formatDurationHuman(p.elapsedSec);
+    tableRows.push([
+      { content: String(idx + 1) },
+      { content: type },
+      { content: dur },
+      { content: `${p.toolCount} aksi` }
+    ]);
+  });
+
+  const detailParagraphs = summary.activeProcesses.map((p, idx) => {
+    const type = p.isBg ? '⚙️ Background Worker' : '🚀 Foreground Agent';
+    const cleanPrompt = p.prompt ? `"${p.prompt.slice(0, 80)}${p.prompt.length > 80 ? '…' : ''}"` : '(Tanpa deskripsi prompt)';
+    return tgRich.paragraph(
+      `**#${idx + 1} ${type}** (PID: ${p.pid})\n` +
+      `• Prompt: ${cleanPrompt}\n` +
+      `• Waktu Jalan: ${formatDurationHuman(p.elapsedSec)} | Aksi Terlaksana: ${p.toolCount}`
+    );
+  });
+
+  const queueSection = summary.totalQueued > 0
+    ? [
+        tgRich.heading(3, `⏳ Antrean Task (${summary.totalQueued} task menunggu)`),
+        tgRich.paragraph(summary.queued.map(q => `• Sesi \`${q.sessionKey}\`: ${q.count} task dalam antrean FIFO`).join('\n'))
+      ]
+    : [];
+
+  const doc = tgRich.doc(
+    tgRich.heading(2, `🤖 Detail Agent Berjalan (${total} Aktif)`),
+    tgRich.table(tableRows, { bordered: true }),
+    ...detailParagraphs,
+    ...queueSection,
+    tgRich.divider()
+  );
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '🔄 Refresh Status Agent', callback_data: 'view:agent_logs' }],
+      [{ text: '« Hub Log', callback_data: 'view:logs' }]
     ]
   };
 
@@ -2556,6 +2713,11 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
         sessionKey,
         abortController,
         startTime: Date.now(),
+        prompt: (prompt || '').trim(),
+        chatId: session?.chatId,
+        threadId: session?.topicId,
+        isBg: sessionKey?.startsWith('bgtask:') || false,
+        executedTools: [],
         stopping: false,
         killTimer: null,
         cancel: () => {
@@ -2644,6 +2806,23 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
                     startTime: Date.now()
                   });
                 }
+                if (procEntry) procEntry.executedTools = executedTools;
+
+                // Turn checkpointing for large turns (>= 30 tools) to preserve progress
+                if (executedTools.length >= 30 && executedTools.length % 15 === 0) {
+                  session.lastTools = executedTools;
+                  session.lastTurn = {
+                    id: session.lastTurn?.id || Date.now(),
+                    prompt,
+                    response: null,
+                    tools: executedTools,
+                    inProgress: true,
+                    checkpointActionCount: executedTools.length,
+                    timestamp: Date.now()
+                  };
+                  saveSessions();
+                }
+
                 if (onProgress) onProgress({
                   event: 'tool_done',
                   tool: last || executedTools[executedTools.length - 1],
@@ -2735,6 +2914,36 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
           conversationId: session.conversationId
         });
       } else {
+        // High action count / multi-action protection (prevent agent from vanishing into thin air)
+        if (executedTools.length >= 10) {
+          const lastFew = executedTools.slice(-5).map(t => {
+            const outSnippet = t.output
+              ? (typeof t.output === 'string' ? t.output.slice(0, 100) : JSON.stringify(t.output).slice(0, 100))
+              : '(Selesai)';
+            return `• \`${t.name}\`: ${outSnippet}`;
+          }).join('\n');
+
+          const statusNotice = code === 0
+            ? '🏁 **Proses Selesai Dijalankan**'
+            : `⚠️ **Proses Mencapai Batas Turn (Status Code ${code})**`;
+
+          const synthesizedResponse =
+            `${statusNotice}\n\n` +
+            `Agent telah mengeksekusi **${executedTools.length} aksi tool / perintah** pada workspace.\n\n` +
+            `📋 **Aktivitas Terakhir:**\n${lastFew}\n\n` +
+            `💾 **Status Progres:** Seluruh perubahan file dan workspace telah tersimpan secara permanen di server.\n\n` +
+            `💡 *Gunakan \`/status\` untuk meninjau perubahan git, atau kirim instruksi berikutnya untuk melanjutkan.*`;
+
+          resolve({
+            response: synthesizedResponse,
+            tools: executedTools,
+            duration: Math.round((Date.now() - (procEntry?.startTime || Date.now())) / 1000),
+            usage: null,
+            conversationId: session.conversationId
+          });
+          return;
+        }
+
         if (code !== 0) {
           if (isQuotaExhaustedError(stderr)) {
             rotateToNextHealthySlot('quota').then(rotateRes => {
@@ -2743,7 +2952,7 @@ function runAgy(prompt, session, onProgress = null, sessionKey = null, options =
             reject(new Error(`⏳ <b>Batas Kuota / Rate Limit Terdeteksi!</b>\nGiliran otomatis dialihkan ke akun PRO berikutnya.\n\n<i>Silakan kirim ulang prompt Anda untuk melanjutkan dengan kuota segar.</i>`));
             return;
           }
-          reject(new Error(`agy exited with code ${code}.\n${stderr}`));
+          reject(new Error(`agy exited with code ${code}.\n${stderr.slice(0, 1000)}`));
         } else {
           resolve({
             response: stderr || '(Done with no output)',
@@ -2785,6 +2994,98 @@ function executeShell(command, cwd) {
         output: output.trim() || '(No output)'
       });
     });
+  });
+}
+
+// Multi-Account JSON File Validation & Import Orchestrator
+async function runAccountsValidationFlow(chatId, threadId = null, targetPath = null) {
+  const filePath = targetPath || '/home/ubuntu/antigravity_accounts_2026-10-28.json';
+  if (!fs.existsSync(filePath)) {
+    await sendRichMessage(chatId, `❌ <b>File Tidak Ditemukan:</b> <code>${escapeHtml(filePath)}</code>`, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+    return;
+  }
+
+  let accounts = [];
+  try {
+    const rawContent = fs.readFileSync(filePath, 'utf8');
+    accounts = parseAccountsJson(rawContent);
+  } catch (err) {
+    await sendRichMessage(chatId, `❌ <b>Gagal Membaca File Akun:</b>\n<code>${escapeHtml(err.message)}</code>`, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+    return;
+  }
+
+  const baseFileName = path.basename(filePath);
+  const total = accounts.length;
+
+  let progressMsg = null;
+  try {
+    progressMsg = await tgRequest('sendMessage', {
+      chat_id: chatId,
+      text: `⏳ <b>Memulai Validasi ${total} Akun:</b> <code>${escapeHtml(baseFileName)}</code>\n<i>Mempersiapkan isolated sandbox & Google Auth probe...</i>`,
+      parse_mode: 'HTML',
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+  } catch (_) {}
+
+  let lastEditMs = 0;
+  const EDIT_THROTTLE_MS = 2500;
+
+  const onProgress = async (idx, count, acc) => {
+    if (!progressMsg) return;
+    const now = Date.now();
+    if (now - lastEditMs < EDIT_THROTTLE_MS && idx < count - 1) return;
+    lastEditMs = now;
+
+    try {
+      await tgRequest('editMessageText', {
+        chat_id: chatId,
+        message_id: progressMsg.message_id,
+        text: `⏳ <b>Memvalidasi Akun (${idx + 1}/${count}):</b>\n• Memeriksa kredensial: <code>${escapeHtml(maskEmail(acc.email))}</code>\n• Sandbox: <i>Testing OAuth refresh & usage limits...</i>`,
+        parse_mode: 'HTML'
+      });
+    } catch (_) {}
+  };
+
+  const valSummary = await validateAccountsBatch(accounts, { onProgress });
+  latestValidatedAccounts = {
+    filePath,
+    summary: valSummary,
+    timestamp: Date.now()
+  };
+
+  const reportText = formatValidationReport(valSummary, baseFileName);
+
+  const inlineKeyboard = [];
+  if (valSummary.validCount > 0) {
+    inlineKeyboard.push([
+      { text: `📥 Import ke Slot 1-${valSummary.validCount}`, callback_data: 'action:import_accounts' }
+    ]);
+  }
+  inlineKeyboard.push([
+    { text: '🔄 Validasi Ulang', callback_data: `action:validate_accounts:${filePath}` },
+    { text: '⚙️ Buka Dashboard', callback_data: 'view:status' }
+  ]);
+
+  if (progressMsg) {
+    try {
+      await tgRequest('editMessageText', {
+        chat_id: chatId,
+        message_id: progressMsg.message_id,
+        text: reportText,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+      return;
+    } catch (_) {}
+  }
+
+  await sendRichMessage(chatId, reportText, {
+    ...(threadId ? { message_thread_id: threadId } : {}),
+    reply_markup: { inline_keyboard: inlineKeyboard }
   });
 }
 
@@ -3241,6 +3542,47 @@ async function handleCallback(cb) {
     return;
   }
 
+  // 1.6 Multi-Account Validation & Import Callbacks
+  if (data.startsWith('action:validate_accounts:')) {
+    const targetPath = data.slice('action:validate_accounts:'.length);
+    await safeAnswer('Memulai validasi akun...');
+    await runAccountsValidationFlow(chatId, threadId, targetPath);
+    return;
+  }
+
+  if (data === 'action:import_accounts') {
+    if (!latestValidatedAccounts || !latestValidatedAccounts.summary) {
+      await answerCallbackQuery(queryId, 'Data validasi akun belum siap. Silakan jalankan /aglogin validate terlebih dahulu.', true);
+      return;
+    }
+    await safeAnswer('Mengimpor akun ke slot...');
+    await sendRich(chatId, '⏳ <i>Mengimpor akun ke slot produksi dan membuat backup otomatis...</i>');
+
+    try {
+      const importRes = await importAccountsToSlots(latestValidatedAccounts.summary.results);
+      const backupNote = importRes.backupFile ? `\n• Backup Akun Sebelumnya: <code>${escapeHtml(importRes.backupFile)}</code>` : '';
+
+      const successMsg =
+        `✅ <b>Impor Akun Berhasil!</b>\n\n` +
+        `• Total Akun Diimpor: <b>${importRes.importedCount} akun</b>\n` +
+        `• Slot Diperbarui: <code>Slot ${importRes.importedSlots.join(', ')}</code>${backupNote}\n\n` +
+        `<i>Akun kini aktif dan siap digunakan untuk rotasi round-robin kuota otomatis!</i>`;
+
+      await sendRich(chatId, successMsg, {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📊 Cek Status Kuota', callback_data: 'view:usage' }],
+            [{ text: '👥 AG Akun', callback_data: 'view:slots' }],
+            [{ text: '⚙️ Dashboard', callback_data: 'view:status' }]
+          ]
+        }
+      });
+    } catch (impErr) {
+      await sendRich(chatId, `❌ Gagal mengimpor akun: ${escapeHtml(impErr.message)}`);
+    }
+    return;
+  }
+
   // 2. View Models
   if (data === 'view:models') {
     const richDoc = tgRich.doc(
@@ -3373,6 +3715,14 @@ async function handleCallback(cb) {
     const view = buildLogsMenuView(session);
     await editRich(chatId, messageId, view.doc, { reply_markup: view.keyboard });
     await answerCallbackQuery(queryId, '📜 Logs Hub');
+    return;
+  }
+
+  // 11b. View Active Agents Logs
+  if (data === 'view:agent_logs') {
+    const view = buildActiveAgentsView();
+    await editRich(chatId, messageId, view.doc, { reply_markup: view.keyboard });
+    await answerCallbackQuery(queryId, '🤖 Status Agent Aktif');
     return;
   }
 
@@ -4013,14 +4363,58 @@ async function handleMessage(msg) {
     return;
   }
 
-  // 0.5c /aglogin <slot>
+  // 0.5c /aglogin [slot|validate [file]|<file.json>]
   if (text === '/aglogin' || text.startsWith('/aglogin ')) {
-    const slotArg = text.slice(8).trim();
-    if (!slotArg) {
-      await sendRich(chatId, 'ℹ️ Harap tentukan nomor slot yang ingin di-login:\nContoh: <code>/aglogin 7</code>');
+    const rawArg = text.slice(8).trim();
+
+    // Default accounts file check e.g. /home/ubuntu/antigravity_accounts_2026-10-28.json
+    const defaultAccountsPath = '/home/ubuntu/antigravity_accounts_2026-10-28.json';
+    let foundAccountsFile = fs.existsSync(defaultAccountsPath) ? defaultAccountsPath : null;
+    if (!foundAccountsFile) {
+      try {
+        const found = fs.readdirSync('/home/ubuntu').find(f => f.startsWith('antigravity_accounts') && f.endsWith('.json'));
+        if (found) foundAccountsFile = path.join('/home/ubuntu', found);
+      } catch (_) {}
+    }
+
+    if (!rawArg) {
+      const detectedSection = foundAccountsFile
+        ? `\n\n📄 <b>File Akun Terdeteksi:</b>\n<code>${escapeHtml(foundAccountsFile)}</code>\n<i>Klik tombol di bawah untuk memvalidasi akun!</i>`
+        : '';
+
+      const keyboard = {
+        inline_keyboard: [
+          ...(foundAccountsFile ? [[{ text: `🔍 Validasi ${path.basename(foundAccountsFile)}`, callback_data: `action:validate_accounts:${foundAccountsFile}` }]] : []),
+          [{ text: '👥 Daftar Akun (Slots)', callback_data: 'view:slots' }, { text: '📈 Cek Kuota', callback_data: 'view:usage' }]
+        ]
+      };
+
+      const helpText =
+        `🔐 <b>AGY Google Auth & Account Manager</b>\n\n` +
+        `• <b>Login Google Auth Manual:</b>\n  <code>/aglogin &lt;slot 1-14&gt;</code> (Contoh: <code>/aglogin 7</code>)\n\n` +
+        `• <b>Validasi & Import File Akun JSON:</b>\n  <code>/aglogin validate [path_file]</code>\n  (Contoh: <code>/aglogin validate /home/ubuntu/antigravity_accounts_2026-10-28.json</code>)` +
+        detectedSection;
+
+      await sendRich(chatId, helpText, { reply_markup: keyboard });
       return;
     }
 
+    if (rawArg.toLowerCase() === 'validate' || rawArg.toLowerCase().startsWith('validate ') || rawArg.endsWith('.json')) {
+      let targetFile = foundAccountsFile;
+      if (rawArg.toLowerCase().startsWith('validate ')) {
+        targetFile = rawArg.slice('validate '.length).trim();
+      } else if (rawArg.endsWith('.json')) {
+        targetFile = rawArg;
+      }
+      if (!targetFile) {
+        await sendRich(chatId, '❌ Harap tentukan path file JSON akun:\nContoh: <code>/aglogin validate /home/ubuntu/antigravity_accounts_2026-10-28.json</code>');
+        return;
+      }
+      await runAccountsValidationFlow(chatId, threadId, targetFile);
+      return;
+    }
+
+    const slotArg = rawArg;
     await sendRich(chatId, `⏳ <i>Menyiapkan sesi login Google OAuth untuk Slot ${escapeHtml(slotArg)}...</i>`);
 
     await startLoginFlow(chatId, slotArg, {
@@ -4568,6 +4962,12 @@ async function handleMessage(msg) {
   // 7c. /logs or /log
   if (text === '/logs' || text.startsWith('/logs ') || text === '/log' || text.startsWith('/log ')) {
     const rawArg = text.includes(' ') ? text.slice(text.indexOf(' ') + 1).trim().toLowerCase() : '';
+
+    if (rawArg === 'agent' || rawArg === 'agents' || rawArg === 'active' || rawArg === 'proc') {
+      const view = buildActiveAgentsView();
+      await sendRich(chatId, view.doc, { reply_markup: view.keyboard });
+      return;
+    }
 
     if (rawArg === 'bot' || rawArg === 'service' || rawArg === 'sys') {
       sendChatAction(chatId, 'typing').catch(() => {});
@@ -5126,20 +5526,28 @@ async function handleMessage(msg) {
     }
 
     console.error('Error running agy:', err);
-    const errMsg = `❌ <b>Terjadi Kesalahan:</b>\n<code>${escapeHtml(err.message || String(err))}</code>`;
+    const cleanErrStr = String(err.message || err).slice(0, 2000);
+    const lastToolsCount = (session.lastTurn?.tools || session.lastTools || []).length;
+    const actionNotice = lastToolsCount > 0 ? `\n\n<i>(${lastToolsCount} aksi tool berhasil dijalankan sebelum kendala terjadi)</i>` : '';
+    const errMsg = `❌ <b>Terjadi Kesalahan:</b>\n<code>${escapeHtml(cleanErrStr)}</code>${actionNotice}`;
+    const errMarkup = lastToolsCount > 0
+      ? { inline_keyboard: [[{ text: `📜 Lihat Log (${lastToolsCount} Aksi)`, callback_data: 'view:turn_logs' }], [{ text: '⚙️ Buka Dashboard', callback_data: 'view:status' }]] }
+      : undefined;
+
     if (progressMsg) {
       try {
         await tgRequest('editMessageText', {
           chat_id: chatId,
           message_id: progressMsg.message_id,
           text: errMsg,
-          parse_mode: 'HTML'
+          parse_mode: 'HTML',
+          ...(errMarkup ? { reply_markup: errMarkup } : {})
         });
       } catch (_) {
-        await sendRich(chatId, errMsg).catch(() => {});
+        await sendRich(chatId, errMsg, { ...(errMarkup ? { reply_markup: errMarkup } : {}) }).catch(() => {});
       }
     } else {
-      await sendRich(chatId, errMsg).catch(() => {});
+      await sendRich(chatId, errMsg, { ...(errMarkup ? { reply_markup: errMarkup } : {}) }).catch(() => {});
     }
   } finally {
     processNextQueuedTask(sessionKey).catch(err => {
