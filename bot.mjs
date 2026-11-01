@@ -3066,7 +3066,7 @@ async function runAccountsValidationFlow(chatId, threadId = null, targetPath = n
     ]);
   }
   inlineKeyboard.push([
-    { text: '🔄 Validasi Ulang', callback_data: `action:validate_accounts:${filePath}` },
+    { text: '🔄 Validasi Ulang', callback_data: 'action:validate_accounts' },
     { text: '⚙️ Buka Dashboard', callback_data: 'view:status' }
   ]);
 
@@ -3543,8 +3543,14 @@ async function handleCallback(cb) {
   }
 
   // 1.6 Multi-Account Validation & Import Callbacks
-  if (data.startsWith('action:validate_accounts:')) {
-    const targetPath = data.slice('action:validate_accounts:'.length);
+  if (data === 'action:validate_accounts' || data.startsWith('action:validate_accounts:')) {
+    let targetPath = null;
+    if (data.startsWith('action:validate_accounts:')) {
+      targetPath = data.slice('action:validate_accounts:'.length);
+    }
+    if (!targetPath) {
+      targetPath = latestValidatedAccounts?.filePath || '/home/ubuntu/antigravity_accounts_2026-10-28.json';
+    }
     await safeAnswer('Memulai validasi akun...');
     await runAccountsValidationFlow(chatId, threadId, targetPath);
     return;
@@ -4384,7 +4390,7 @@ async function handleMessage(msg) {
 
       const keyboard = {
         inline_keyboard: [
-          ...(foundAccountsFile ? [[{ text: `🔍 Validasi ${path.basename(foundAccountsFile)}`, callback_data: `action:validate_accounts:${foundAccountsFile}` }]] : []),
+          ...(foundAccountsFile ? [[{ text: `🔍 Validasi ${path.basename(foundAccountsFile)}`, callback_data: 'action:validate_accounts' }]] : []),
           [{ text: '👥 Daftar Akun (Slots)', callback_data: 'view:slots' }, { text: '📈 Cek Kuota', callback_data: 'view:usage' }]
         ]
       };
