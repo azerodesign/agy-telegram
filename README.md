@@ -121,14 +121,26 @@ Bot akan otomatis berjalan di background dan otomatis restart bila server reboot
   - `divider` garis pemisah estetis
   - `spoiler`, `bold`, `italic`, `code`
 - **Inline Keyboard Interaktif**: Tombol kontrol instan untuk ganti model, effort, mode kerja, riwayat / resume sesi, logs kode, dan reset sesi.
+- **Smart Task Queue (Multi-Process Handling)**:
+  - Instruksi yang dikirim saat bot sedang sibuk tidak akan ditolak; otomatis masuk antrian FIFO dan diproses berurutan.
+  - Tombol batal antrian untuk menghapus pesan tertunda kapan saja.
+- **Side Query & Background Workers**:
+  - `/btw <tanya>`: Mengajukan pertanyaan cepat atau konsultasi tanpa memotong / mengganggu task utama yang sedang berjalan.
+  - `/bgtask <task>`: Menjalankan tugas panjang secara independen di latar belakang dengan ID task tersendiri.
 - **Real-time Code Execution & Logs**:
-  - Live progress update saat agent mengeksekusi kode, bash command, dan manipulasi file.
+  - Live progress update saat agent mengeksekusi kode, bash command, manipulasi file, hingga instruksi berbasis foto/screenshot.
   - Tombol interaktif `📜 Logs Kode` di bawah setiap respons untuk melihat detail command, parameter, syntax highlighting, dan exit output.
   - Hub Log terpusat `/logs` untuk meninjau log kode terakhir, riwayat sesi, dan service systemd bot.
+- **Smart Multi-Auth & Quota Management**:
+  - `/agusage`: Visualisasi progress bar kuota 14 akun Google Auth AGY.
+  - `/agswitch [slot]`: Berpindah slot akun aktif secara manual atau interaktif via inline keyboard.
+  - `/aglogin <slot>`: Wizard login OAuth Google langsung via chat Telegram.
+- **Git Operations Hub**:
+  - `/git` untuk inspeksi branch, status perubahan, git diff visual, commit, dan push langsung dari Telegram.
 - **Resume & Riwayat Percakapan**: Melanjutkan sesi obrolan sebelumnya melalui menu interaktif atau perintah langsung `/resume <nomor|ID|kata kunci>`.
 - **Dua Arah Transfer File**:
   - Download file server ke HP: `/get <nama_file>`
-  - Upload file HP ke server: Cukup kirim file ke bot
+  - Upload file HP ke server: Cukup kirim file/foto ke bot (mendukung album debouncing).
 - **Direct Terminal Shell**: `/sh <cmd>` untuk menjalankan perintah Linux secara instan.
 
 ---
@@ -138,17 +150,25 @@ Bot akan otomatis berjalan di background dan otomatis restart bila server reboot
 | Perintah | Fungsi |
 |---|---|
 | `/menu` / `/settings` | Tampilkan Dashboard Utama dengan tabel dan Inline Keyboard |
+| `/btw <pertanyaan>` | Tanya info/konsultasi cepat tanpa memotong/mengganggu tugas aktif |
+| `/bgtask <task>` | Jalankan perintah/tugas berat secara mandiri di latar belakang |
+| `/agusage` | Cek kuota visual & status 14 slot akun Google Auth |
+| `/agswitch [slot]` | Pindah slot akun aktif (inline keyboard atau nomor slot) |
+| `/aglogin <slot>` | Wizard login/perpanjang token Google OAuth via chat |
+| `/git [status\|diff\|push\|pull]` | Hub manajemen git repository dari Telegram |
 | `/model` | Keyboard visual pemilihan model AI |
 | `/models` | Daftar lengkap model yang tersedia |
 | `/effort` | Atur intensitas penalaran (Low/Med/High/Max) |
 | `/mode` | Atur mode kerja agent (Auto/Plan/Accept-Edits) |
 | `/resume [id]` | Lanjutkan sesi percakapan sebelumnya (menu visual / nomor / ID / keyword) |
-| `/logs [code|conv|bot]` | Hub & viewer log eksekusi kode, tool, dan systemd service |
+| `/logs [code\|conv\|bot]` | Hub & viewer log eksekusi kode, tool, dan systemd service |
 | `/get <file>` | Download file server ke chat Telegram |
 | `/sh <cmd>` | Eksekusi shell terminal langsung |
 | `/ls` | Lihat daftar file di folder server aktif |
 | `/cd <path>` | Navigasi direktori kerja server |
 | `/pwd` | Cek path lokasi kerja saat ini |
+| `/stop` | Hentikan eksekusi aktif dan bersihkan antrian |
+| `/restart` | Reboot service AGY Telegram Bridge dengan notifikasi recovery |
 | `/new` / `/reset` | Reset sesi memori percakapan |
 | `/help` | Panduan lengkap seluruh fitur |
 

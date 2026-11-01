@@ -71,6 +71,12 @@ let ALLOWED_TOPICS = (process.env.ALLOWED_TOPICS || '7')
 // Active processes map: sessionKey -> { child, startTime, cancel: () => void }
 const activeProcesses = new Map();
 
+// Active task queues for queued instructions: sessionKey -> Array<{ id, text, msg, chatId, threadId, userId, timestamp }>
+const sessionTaskQueues = new Map();
+
+// Active background tasks: bgTaskId -> { id, prompt, child, startTime, chatId, threadId, sessionKey, status, result, error }
+const backgroundTasks = new Map();
+
 // Active cloudflare tunnels: port -> { child, url, startTime }
 const activeTunnels = new Map();
 
@@ -2811,16 +2817,62 @@ async function handleCallback(cb) {
   if (data.startsWith('action:stop')) {
     const parts = data.split(':');
     const targetKey = parts.length > 2 ? parts.slice(2).join(':') : sessionKey;
+    if (sessionTaskQueues.has(targetKey)) {
+      sessionTaskQueues.delete(targetKey);
+    }
     if (activeProcesses.has(targetKey)) {
       const proc = activeProcesses.get(targetKey);
       proc.cancel();
-      await answerCallbackQuery(queryId, '🛑 Proses dihentikan!', true);
+      await safeAnswer('🛑 Proses dihentikan!', true);
       try {
         await editRich(chatId, messageId, '🛑 <b>Eksekusi AGY dibatalkan oleh pengguna.</b>');
       } catch (_) {}
     } else {
-      await answerCallbackQuery(queryId, 'ℹ️ Tidak ada proses aktif.', false);
+      await safeAnswer('ℹ️ Tidak ada proses aktif.', false);
     }
+    return;
+  }
+
+  // 0.0b Action Stop Background Task
+  if (data.startsWith('action:stop_bg:')) {
+    const bgId = data.slice('action:stop_bg:'.length);
+    const bgSessionKey = `bgtask:${bgId}`;
+    let cancelled = false;
+    if (activeProcesses.has(bgSessionKey)) {
+      activeProcesses.get(bgSessionKey).cancel();
+      cancelled = true;
+    }
+    backgroundTasks.delete(bgId);
+    if (cancelled) {
+      await safeAnswer('🛑 Background task dihentikan!', true);
+      try {
+        await editRich(chatId, messageId, `🛑 <b>Background task [<code>${escapeHtml(bgId)}</code>] telah dibatalkan oleh pengguna.</b>`);
+      } catch (_) {}
+    } else {
+      await safeAnswer('ℹ️ Background task tidak ditemukan atau sudah selesai.', false);
+    }
+    return;
+  }
+
+  // 0.0c Action Cancel Queued Task
+  if (data.startsWith('action:cancel_queue:')) {
+    const parts = data.split(':');
+    const itemId = parts[parts.length - 1];
+    const targetKey = parts.slice(2, parts.length - 1).join(':') || sessionKey;
+    const queue = sessionTaskQueues.get(targetKey);
+    if (queue) {
+      const idx = queue.findIndex(item => String(item.id) === String(itemId));
+      if (idx !== -1) {
+        queue.splice(idx, 1);
+        if (queue.length === 0) sessionTaskQueues.delete(targetKey);
+        await safeAnswer('🗑️ Antrian dibatalkan.');
+        try {
+          await editRich(chatId, messageId, '🗑️ <b>Instruksi dalam antrian berhasil dibatalkan.</b>');
+        } catch (_) {}
+        return;
+      }
+    }
+    await safeAnswer('ℹ️ Item antrian tidak ditemukan atau sudah diproses.');
     return;
   }
 
@@ -3446,6 +3498,33 @@ async function handleMediaGroupCompletion(entry) {
   }
 }
 
+async function processNextQueuedTask(sessionKey) {
+  const queue = sessionTaskQueues.get(sessionKey);
+  if (!queue || queue.length === 0) return;
+
+  const nextTask = queue.shift();
+  if (queue.length === 0) {
+    sessionTaskQueues.delete(sessionKey);
+  }
+
+  console.log(`[TASK-QUEUE] Executing queued task for ${sessionKey}: "${nextTask.text.slice(0, 40)}" (${queue.length} remaining)`);
+
+  const queueCountInfo = queue.length > 0 ? `\n\nℹ️ <i>(${queue.length} tugas lagi dalam antrian)</i>` : '';
+  await sendRichMessageLegacy(nextTask.chatId,
+    `▶️ <b>Memulai Tugas dari Antrian:</b>\n` +
+    `<i>"${escapeHtml(nextTask.text.length > 80 ? nextTask.text.slice(0, 80) + '...' : nextTask.text)}"</i>${queueCountInfo}`,
+    {
+      ...(nextTask.threadId ? { message_thread_id: nextTask.threadId } : {})
+    }
+  );
+
+  try {
+    await handleMessage(nextTask.msg);
+  } catch (err) {
+    console.error(`[TASK-QUEUE] Error processing queued task for ${sessionKey}:`, err);
+  }
+}
+
 // Main Message Handler
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
@@ -3597,68 +3676,14 @@ async function handleMessage(msg) {
         }
 
         const prompt = `Saya baru saja mengunggah file ${saved.name} ke ${saved.path}. Instruksi: ${msg.caption}`;
-        const typingTimer = setInterval(() => sendChatAction(chatId, 'typing').catch(() => {}), 4000);
-        sendChatAction(chatId, 'typing').catch(() => {});
-        try {
-          const res = await runAgy(prompt, session);
-          clearInterval(typingTimer);
-          session.lastTools = res.tools || [];
-          session.lastTurn = {
-            id: Date.now(),
-            prompt,
-            response: res.response,
-            tools: res.tools || [],
-            duration: res.duration,
-            usage: res.usage,
-            timestamp: Date.now()
-          };
-          saveSessions();
-          const inlineKeyboard = [];
-          if (res.tools && res.tools.length > 0) {
-            inlineKeyboard.push([{ text: `📜 Logs Kode (${res.tools.length} Aksi)`, callback_data: 'view:turn_logs' }]);
-          }
-          inlineKeyboard.push([
-            { text: '🔄 Reset Sesi', callback_data: 'action:reset' },
-            { text: '▶️ Riwayat Sesi', callback_data: 'view:resume' },
-            { text: '⚙️ Dashboard', callback_data: 'view:status' }
-          ]);
-
-          const fileChunks = splitRichMarkdown(res.response, 30000);
-          session.pendingDelivery = {
-            turnId: session.lastTurn.id,
-            chunks: fileChunks,
-            chunkStatuses: new Array(fileChunks.length).fill('pending'),
-            deliveredCount: 0,
-            skippedCount: 0,
-            currentChunkIndex: 0,
-            currentChunkStatus: 'pending',
-            status: 'pending',
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
-            lastError: null,
-            replyMarkup: { inline_keyboard: inlineKeyboard }
-          };
-          saveSessions();
-
-          await executeResumableDelivery(session, chatId, {
-            reply_markup: { inline_keyboard: inlineKeyboard },
-            message_thread_id: threadId
-          });
-        } catch (e) {
-          clearInterval(typingTimer);
-          const errClass = classifyTelegramError(e);
-          if (errClass.isAmbiguous) {
-            console.error(
-              `[DUPLICATE-PREVENTION] File caption delivery failed with ambiguous transport failure (${errClass.reason}: ${e.message}). Skipping duplicate-send fallback.`
-            );
-          } else if (errClass.isRateLimit || e.isRateLimitExhausted) {
-            console.error(
-              `[RATE-LIMIT-EXHAUSTED] File caption delivery failed with HTTP 429 rate limit. Skipping fallback to avoid duplicate flood.`
-            );
-          } else {
-            console.warn(`File caption delivery failed (${errClass.errorCode}: ${e.message}).`);
-          }
-        }
+        // Delegate to handleMessage to get full realtime progress logger, cancellation, and Smart Task Queue!
+        await handleMessage({
+          chat: msg.chat,
+          message_thread_id: threadId,
+          from: msg.from,
+          text: prompt
+        });
+        return;
       }
     } catch (err) {
       console.error('File upload error:', err);
@@ -3746,9 +3771,19 @@ async function handleMessage(msg) {
 
   // 0. /stop
   if (text === '/stop') {
+    let stoppedAny = false;
     if (activeProcesses.has(sessionKey)) {
       const proc = activeProcesses.get(sessionKey);
       proc.cancel();
+      stoppedAny = true;
+    }
+    if (sessionTaskQueues.has(sessionKey)) {
+      const qCount = sessionTaskQueues.get(sessionKey).length;
+      sessionTaskQueues.delete(sessionKey);
+      await sendRich(chatId, `🛑 <b>Eksekusi dihentikan dan ${qCount} tugas dalam antrian dibatalkan.</b>`);
+      return;
+    }
+    if (stoppedAny) {
       await sendRich(chatId, '🛑 <b>Eksekusi AGY berhasil dihentikan.</b>');
     } else {
       await sendRich(chatId, 'ℹ️ Tidak ada proses AGY yang sedang berjalan.');
@@ -3811,6 +3846,133 @@ async function handleMessage(msg) {
       });
       child.unref();
     }, 500);
+
+    return;
+  }
+
+  // 0.2c /btw <pertanyaan> (Quick query without interrupting main task)
+  if (text === '/btw' || text.startsWith('/btw ')) {
+    const query = text.slice(4).trim();
+    if (!query) {
+      await sendRich(chatId,
+        `💡 <b>Fitur /btw (By The Way):</b>\n\n` +
+        `Ajukan pertanyaan cepat atau cek info teknis <b>tanpa mengganggu atau membatalkan tugas utama</b> yang sedang berjalan!\n\n` +
+        `<b>Contoh penggunaan:</b>\n` +
+        `• <code>/btw apa port default redis?</code>\n` +
+        `• <code>/btw fungsi useEffect di react itu buat apa?</code>`
+      );
+      return;
+    }
+
+    sendChatAction(chatId, 'typing', threadId).catch(() => {});
+    const btwTimer = setInterval(() => sendChatAction(chatId, 'typing', threadId).catch(() => {}), 4000);
+
+    try {
+      const ephemeralSession = {
+        conversationId: null,
+        workingDir: session.workingDir || DEFAULT_DIR,
+        model: session.model || 'gemini-3.8-flash-high',
+        mode: 'auto',
+        effort: 'low'
+      };
+
+      const btwRes = await runAgy(query, ephemeralSession, null, null);
+      clearInterval(btwTimer);
+
+      const responseText = `💡 <b>[BTW — Jawaban Cepat]</b>\n` +
+        `<i>Q: "${escapeHtml(query)}"</i>\n\n` +
+        btwRes.response;
+
+      await sendRich(chatId, responseText);
+    } catch (err) {
+      clearInterval(btwTimer);
+      await sendRich(chatId, `❌ Gagal memproses /btw: ${err.message}`);
+    }
+    return;
+  }
+
+  // 0.2d /bgtask <task> (Independent Background Worker)
+  if (text === '/bgtask' || text.startsWith('/bgtask ')) {
+    const taskPrompt = text.slice(7).trim();
+    if (!taskPrompt) {
+      await sendRich(chatId,
+        `🚀 <b>Fitur /bgtask (Background Task):</b>\n\n` +
+        `Jalankan tugas atau perintah panjang secara <b>mandiri di latar belakang</b> tanpa memblokir sesi chat utama Anda.\n\n` +
+        `<b>Contoh penggunaan:</b>\n` +
+        `• <code>/bgtask jalankan npm test dan catat hasilnya</code>\n` +
+        `• <code>/bgtask cek semua dependency out of date di repositori ini</code>`
+      );
+      return;
+    }
+
+    const bgId = `bg_${Date.now().toString(36)}`;
+    const bgSession = {
+      conversationId: null,
+      workingDir: session.workingDir || DEFAULT_DIR,
+      model: session.model,
+      mode: 'auto',
+      effort: session.effort
+    };
+
+    const bgEntry = {
+      id: bgId,
+      prompt: taskPrompt,
+      chatId,
+      threadId,
+      sessionKey,
+      startTime: Date.now(),
+      status: 'running'
+    };
+
+    backgroundTasks.set(bgId, bgEntry);
+
+    await sendRich(chatId,
+      `🚀 <b>Background Task Berjalan!</b>\n\n` +
+      `<b>ID:</b> <code>${bgId}</code>\n` +
+      `<b>Task:</b> <i>"${escapeHtml(taskPrompt)}"</i>\n` +
+      `<b>Status:</b> ⚙️ Diproses di latar belakang...\n\n` +
+      `<i>Sesi utama Anda tetap bebas digunakan untuk instruksi lain!</i>`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🛑 Hentikan BG Task', callback_data: `action:stop_bg:${bgId}` }]
+          ]
+        }
+      }
+    );
+
+    (async () => {
+      try {
+        const bgSessionKey = `bgtask:${bgId}`;
+        const res = await runAgy(taskPrompt, bgSession, null, bgSessionKey);
+        const durationSec = ((Date.now() - bgEntry.startTime) / 1000).toFixed(1);
+        bgEntry.status = 'completed';
+        bgEntry.result = res.response;
+
+        const summaryText = `✅ <b>Background Task Selesai! [${bgId}]</b>\n\n` +
+          `<b>Instruksi:</b> <i>"${escapeHtml(taskPrompt)}"</i>\n` +
+          `<b>Durasi:</b> ⏱️ ${durationSec}s\n` +
+          `<b>Aksi Alat:</b> 🛠️ ${(res.tools || []).length} tindakan\n\n` +
+          `<b>Hasil:</b>\n${res.response}`;
+
+        await sendRichMessageLegacy(chatId, summaryText, {
+          ...(threadId ? { message_thread_id: threadId } : {})
+        });
+      } catch (err) {
+        bgEntry.status = 'failed';
+        bgEntry.error = err.message;
+        await sendRichMessageLegacy(chatId,
+          `❌ <b>Background Task Gagal [${bgId}]</b>\n\n` +
+          `<b>Instruksi:</b> <i>"${escapeHtml(taskPrompt)}"</i>\n` +
+          `<b>Error:</b> ${escapeHtml(err.message)}`,
+          {
+            ...(threadId ? { message_thread_id: threadId } : {})
+          }
+        );
+      } finally {
+        backgroundTasks.delete(bgId);
+      }
+    })();
 
     return;
   }
@@ -4562,6 +4724,8 @@ async function handleMessage(msg) {
         [{ content: '/retry_delivery' }, { content: 'Lanjutkan pengiriman jawaban tertunda' }],
         [{ content: '/logs' }, { content: 'Lihat log eksekusi kode & service bot' }],
         [{ content: '/new' }, { content: 'Reset sesi percakapan' }],
+        [{ content: '/btw <q>' }, { content: 'Tanya info tanpa ganggu task utama' }],
+        [{ content: '/bgtask <task>' }, { content: 'Jalankan task independen di background' }],
         [{ content: '/get <file>' }, { content: 'Download file server ke HP' }],
         [{ content: '/sh <cmd>' }, { content: 'Eksekusi shell terminal' }],
         [{ content: '/ls' }, { content: 'Daftar file folder kerja' }],
@@ -4583,15 +4747,42 @@ async function handleMessage(msg) {
     const currentProc = activeProcesses.get(sessionKey);
     const isAlive = currentProc?.child && currentProc.child.exitCode === null && currentProc.child.signalCode === null;
     if (isAlive) {
-      const msg = currentProc.stopping
-        ? '⏳ <i>Proses sebelumnya sedang dihentikan. Mohon tunggu beberapa detik...</i>'
-        : '⏳ <i>AGY sedang menjalankan proses untuk sesi ini. Harap tunggu hingga selesai atau batalkan proses aktif terlebih dahulu.</i>';
-      await sendRich(chatId, msg, {
-        reply_markup: currentProc.stopping ? undefined : {
-          inline_keyboard: [[{ text: '🛑 Batalkan Proses Berjalan', callback_data: `action:stop:${sessionKey}` }]]
-        },
-        ...(threadId ? { message_thread_id: threadId } : {})
-      });
+      if (currentProc.stopping) {
+        await sendRich(chatId, '⏳ <i>Proses sebelumnya sedang dihentikan. Mohon tunggu beberapa detik...</i>');
+        return;
+      }
+
+      // SMART TASK QUEUE: Tambahkan ke antrian tugas sesi (Never reject user prompt)
+      let queue = sessionTaskQueues.get(sessionKey);
+      if (!queue) {
+        queue = [];
+        sessionTaskQueues.set(sessionKey, queue);
+      }
+      const queueItem = {
+        id: Date.now(),
+        text,
+        msg,
+        chatId,
+        threadId,
+        userId,
+        timestamp: Date.now()
+      };
+      queue.push(queueItem);
+
+      await sendRich(chatId,
+        `📥 <b>Instruksi Masuk Antrian [#${queue.length}]</b>\n\n` +
+        `<i>"${escapeHtml(text.length > 100 ? text.slice(0, 100) + '...' : text)}"</i>\n\n` +
+        `⚡ AGY sedang mengerjakan tugas sebelumnya. Instruksi ini akan otomatis dijalankan segera setelah tugas aktif selesai.`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🛑 Batalkan Tugas Aktif', callback_data: `action:stop:${sessionKey}` }],
+              [{ text: `🗑️ Batalkan Antrian Ini (#${queue.length})`, callback_data: `action:cancel_queue:${sessionKey}:${queueItem.id}` }]
+            ]
+          },
+          ...(threadId ? { message_thread_id: threadId } : {})
+        }
+      );
       return;
     } else {
       // Cleanup stale entry jika child process sudah exited
@@ -4950,6 +5141,10 @@ async function handleMessage(msg) {
     } else {
       await sendRich(chatId, errMsg).catch(() => {});
     }
+  } finally {
+    processNextQueuedTask(sessionKey).catch(err => {
+      console.error('[TASK-QUEUE] Error in processNextQueuedTask:', err);
+    });
   }
 }
 
@@ -4970,6 +5165,8 @@ async function registerCommands() {
     { command: 'tree', description: 'Struktur hierarki folder' },
     { command: 'watch', description: 'Monitor service/port di background' },
     { command: 'stop', description: 'Hentikan proses AGY yang berjalan' },
+    { command: 'btw', description: 'Tanya info/pertanyaan tanpa ganggu task' },
+    { command: 'bgtask', description: 'Jalankan task independen di latar belakang' },
     { command: 'restart', description: 'Reboot service AGY Telegram Bridge' },
     { command: 'keyboard', description: 'Tampilkan tombol pintas HP' },
     { command: 'topic', description: 'Informasi topik grup aktif' },
