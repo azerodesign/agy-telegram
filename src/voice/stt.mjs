@@ -19,12 +19,21 @@ const TRANSCRIBE_SCRIPT = path.join(__dirname, 'transcribe.py');
  */
 export async function convertToWav(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    execFile('ffmpeg', ['-y', '-i', inputPath, '-ar', '16000', '-ac', '1', outputPath, '-loglevel', 'error'], (err, stdout, stderr) => {
-      if (err) {
-        return reject(new Error(`FFmpeg conversion failed: ${stderr || err.message}`));
+    execFile(
+      'ffmpeg',
+      ['-y', '-i', inputPath, '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-ar', '16000', '-ac', '1', outputPath, '-loglevel', 'error'],
+      (err, stdout, stderr) => {
+        if (err) {
+          // Fallback to basic conversion if loudnorm filter fails
+          execFile('ffmpeg', ['-y', '-i', inputPath, '-ar', '16000', '-ac', '1', outputPath, '-loglevel', 'error'], (fbErr, fbStdout, fbStderr) => {
+            if (fbErr) return reject(new Error(`FFmpeg conversion failed: ${fbStderr || fbErr.message}`));
+            resolve(outputPath);
+          });
+          return;
+        }
+        resolve(outputPath);
       }
-      resolve(outputPath);
-    });
+    );
   });
 }
 

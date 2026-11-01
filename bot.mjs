@@ -1073,6 +1073,7 @@ async function sendRichMessageNative(chatId, rawMarkdown, options = {}) {
 
     let chunkSent = false;
     let retries429 = 0;
+    let retriesNetwork = 0;
 
     while (!chunkSent) {
       try {
@@ -1272,6 +1273,7 @@ async function executeResumableDelivery(session, chatId, options = {}) {
 
     let chunkSent = false;
     let retries429 = 0;
+    let retriesNetwork = 0;
 
     while (!chunkSent) {
       try {
@@ -1366,6 +1368,16 @@ async function executeResumableDelivery(session, chatId, options = {}) {
         }
 
         // C. Ambiguous Transport Failure (Timeout / Connection Reset / 5xx)
+        if (errClass.isAmbiguous) {
+          retriesNetwork++;
+          if (retriesNetwork <= 3) {
+            console.warn(
+              `[NETWORK-RETRY] Ambiguous transport error on chunk [${i + 1}/${chunks.length}]: ${err.message}. Retrying in ${retriesNetwork * 1500}ms (attempt ${retriesNetwork}/3)...`
+            );
+            await sleepWithAbort(retriesNetwork * 1500, options.abortSignal);
+            continue;
+          }
+        }
         console.error(`sendRichMessage failed with ambiguous transport failure (${errClass.reason}: ${err.message}). Menandai status unknown.`);
         pd.currentChunkStatus = 'unknown';
         pd.chunkStatuses[i] = 'unknown';
@@ -1467,15 +1479,41 @@ async function sendRichMessageLegacy(chatId, docOrMarkdown, options = {}) {
     }
     if (cur) chunks.push(cur);
 
-    let lastRes = null;
+    // Balance open tags across chunks so code blocks and styles continue seamlessly
+    const balancedChunks = [];
+    let openTags = [];
     for (let i = 0; i < chunks.length; i++) {
+      let chunk = chunks[i];
+      if (openTags.length > 0) {
+        chunk = openTags.map(t => `<${t}>`).join('') + chunk;
+      }
+      const tagMatches = chunk.match(/<\/?([a-zA-Z0-9_-]+)[^>]*>/g) || [];
+      const currentStack = [];
+      for (const tag of tagMatches) {
+        const isClosing = tag.startsWith('</');
+        const nameMatch = tag.match(/^<\/?([a-zA-Z0-9_-]+)/);
+        const name = nameMatch ? nameMatch[1].toLowerCase() : '';
+        if (!VALID_TELEGRAM_TAGS.has(name)) continue;
+        if (!isClosing) {
+          currentStack.push(name);
+        } else {
+          const idx = currentStack.lastIndexOf(name);
+          if (idx !== -1) currentStack.splice(idx, 1);
+        }
+      }
+      openTags = [...currentStack];
+      balancedChunks.push(sanitizeTelegramHtml(chunk));
+    }
+
+    let lastRes = null;
+    for (let i = 0; i < balancedChunks.length; i++) {
       if (telegramRateLimitState.isCoolingDown()) {
         await sleepWithAbort(telegramRateLimitState.getRemainingWaitMs(), options.abortSignal);
       } else if (i > 0) {
         await sleepWithAbort(600, options.abortSignal);
       }
-      const isLast = i === chunks.length - 1;
-      const chunkHtml = sanitizeTelegramHtml(chunks[i]);
+      const isLast = i === balancedChunks.length - 1;
+      const chunkHtml = balancedChunks[i];
       try {
         lastRes = await tgRequest('sendMessage', {
           chat_id: chatId,
@@ -2752,8 +2790,15 @@ async function handleCallback(cb) {
   const messageId = cb.message?.message_id;
   const userId = String(cb.from?.id);
 
+  let isCallbackAnswered = false;
+  const safeAnswer = async (text = '', alert = false) => {
+    if (isCallbackAnswered) return;
+    isCallbackAnswered = true;
+    await answerCallbackQuery(queryId, text, alert);
+  };
+
   if (ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(userId)) {
-    await answerCallbackQuery(queryId, '⛔ Akses ditolak.', true);
+    await safeAnswer('⛔ Akses ditolak.', true);
     return;
   }
 
@@ -3103,27 +3148,27 @@ async function handleCallback(cb) {
 
   // 1.5 Git Operations Callbacks
   if (data === 'git:status') {
+    await safeAnswer('⏳ Membaca status Git...');
     const gitStatus = await getGitStatus();
     await editRich(chatId, messageId, gitStatus.text, {
       reply_markup: gitStatus.keyboard
     });
-    await answerCallbackQuery(queryId, 'Status Git diperbarui');
     return;
   }
 
   if (data === 'git:diff') {
+    await safeAnswer('⏳ Membaca git diff...');
     const diffRes = await getGitDiff();
     await editRich(chatId, messageId, diffRes.text, {
       reply_markup: {
         inline_keyboard: [[{ text: '« Kembali ke Status Git', callback_data: 'git:status' }]]
       }
     });
-    await answerCallbackQuery(queryId);
     return;
   }
 
   if (data === 'git:commit_push') {
-    await answerCallbackQuery(queryId, '🚀 Memulai commit & push ke GitHub...');
+    await safeAnswer('🚀 Memulai commit & push ke GitHub...');
     const pushRes = await gitCommitAndPush();
     await editRich(chatId, messageId, pushRes.message, {
       reply_markup: {
@@ -3134,7 +3179,7 @@ async function handleCallback(cb) {
   }
 
   if (data === 'git:pull') {
-    await answerCallbackQuery(queryId, '⬇️ Memulai git pull...');
+    await safeAnswer('⬇️ Memulai git pull...');
     const pullRes = await gitPull();
     await editRich(chatId, messageId, pullRes.message, {
       reply_markup: {
@@ -3361,7 +3406,44 @@ async function handleCallback(cb) {
     return;
   }
 
-  await answerCallbackQuery(queryId);
+  if (!isCallbackAnswered) {
+    await safeAnswer();
+  }
+}
+
+// In-Memory Media Group Buffer for Telegram Album Debouncing
+const mediaGroupBuffers = new Map();
+
+async function handleMediaGroupCompletion(entry) {
+  const { chatId, threadId, sessionKey, files, caption, userId, username } = entry;
+  const session = getSession(sessionKey);
+  const fileLines = files.map(f => `• <b>${escapeHtml(f.name)}</b> (${(f.size / 1024).toFixed(1)} KB) di <code>${escapeHtml(f.path)}</code>`).join('\n');
+  const summaryMsg = `📥 <b>${files.length} Foto/File Berhasil Diunggah ke Server!</b>\n\n${fileLines}\n\n` +
+    (caption ? `<b>Instruksi:</b> ${escapeHtml(caption)}` : `<i>Ketik instruksi jika ingin menganalisis atau mengedit file-file ini.</i>`);
+
+  await sendRichMessageLegacy(chatId, summaryMsg, {
+    ...(threadId ? { message_thread_id: threadId } : {}),
+    reply_markup: {
+      inline_keyboard: [[{ text: '📂 Lihat Folder', callback_data: 'action:ls' }]]
+    }
+  });
+
+  if (caption) {
+    if (session.pendingDelivery && session.pendingDelivery.status !== 'completed') {
+      session.pendingDelivery = null;
+      saveSessions();
+    }
+    const combinedPrompt = `Saya baru saja mengunggah ${files.length} file gambar ke server:\n` +
+      files.map(f => `- ${f.name} di ${f.path}`).join('\n') +
+      `\nInstruksi: ${caption}`;
+
+    await handleMessage({
+      chat: { id: chatId, type: threadId ? 'supergroup' : 'private' },
+      message_thread_id: threadId,
+      from: { id: userId, username },
+      text: combinedPrompt
+    });
+  }
 }
 
 // Main Message Handler
@@ -3453,10 +3535,44 @@ async function handleMessage(msg) {
         const photoArr = msg.photo;
         const highest = photoArr[photoArr.length - 1];
         fileId = highest.file_id;
-        fileName = `photo_${Date.now()}.jpg`;
+        fileName = `photo_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.jpg`;
       }
 
       const saved = await downloadTelegramFile(fileId, session.workingDir, fileName);
+
+      // Handle Album / Media Group Debouncing
+      if (msg.media_group_id) {
+        const mgId = String(msg.media_group_id);
+        let groupEntry = mediaGroupBuffers.get(mgId);
+        if (!groupEntry) {
+          groupEntry = {
+            id: mgId,
+            files: [],
+            caption: msg.caption || '',
+            chatId,
+            threadId,
+            userId,
+            username,
+            sessionKey,
+            timer: null
+          };
+          mediaGroupBuffers.set(mgId, groupEntry);
+        } else {
+          if (msg.caption && !groupEntry.caption) {
+            groupEntry.caption = msg.caption;
+          }
+        }
+
+        groupEntry.files.push(saved);
+        if (groupEntry.timer) clearTimeout(groupEntry.timer);
+
+        groupEntry.timer = setTimeout(async () => {
+          mediaGroupBuffers.delete(mgId);
+          await handleMediaGroupCompletion(groupEntry);
+        }, 1200);
+
+        return;
+      }
       const richDoc = tgRich.doc(
         tgRich.heading(3, '📥 File Berhasil Diunggah ke Server!'),
         tgRich.table([
@@ -3475,26 +3591,9 @@ async function handleMessage(msg) {
 
       if (msg.caption) {
         if (session.pendingDelivery && session.pendingDelivery.status !== 'completed') {
-          const pd = session.pendingDelivery;
-          const total = pd.chunks?.length || 0;
-          const delivered = pd.deliveredCount || 0;
-          const skipped = pd.skippedCount || 0;
-          const infoText = skipped > 0 ? ` (${delivered} terkirim, ${skipped} dilewati)` : '';
-          await sendRich(chatId,
-            `⚠️ <b>Terdapat Pengiriman Jawaban Tertunda!</b>\n\n` +
-            `File berhasil diunggah, namun instruksi caption belum dapat diproses karena masih ada pengiriman jawaban sebelumnya yang belum selesai (${delivered}/${total} bagian terkirim${infoText}).\n\n` +
-            `Gunakan <code>/retry_delivery</code> atau buang jawaban lama terlebih dahulu.`,
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: `🔄 Lanjutkan Pengiriman (${delivered}/${total})`, callback_data: 'action:retry_delivery' }],
-                  [{ text: '🗑️ Buang Jawaban Lama', callback_data: 'action:retry_delivery_discard' }]
-                ]
-              },
-              ...(threadId ? { message_thread_id: threadId } : {})
-            }
-          );
-          return;
+          console.log(`[AUTO-ARCHIVE] Archiving uncompleted pendingDelivery for captioned photo prompt.`);
+          session.pendingDelivery = null;
+          saveSessions();
         }
 
         const prompt = `Saya baru saja mengunggah file ${saved.name} ke ${saved.path}. Instruksi: ${msg.caption}`;
@@ -4500,28 +4599,12 @@ async function handleMessage(msg) {
     }
   }
 
-  // Cek apakah ada pengiriman jawaban yang belum selesai (Multiple Pending Delivery Protection)
+  // Auto-Archive stale/uncompleted pendingDelivery on new user prompt (Never block user workflow)
   if (session.pendingDelivery && session.pendingDelivery.status !== 'completed') {
     const pd = session.pendingDelivery;
-    const total = pd.chunks?.length || 0;
-    const delivered = pd.deliveredCount || 0;
-    const skipped = pd.skippedCount || 0;
-    const infoText = skipped > 0 ? ` (${delivered} terkirim, ${skipped} dilewati)` : '';
-    await sendRich(chatId,
-      `⚠️ <b>Terdapat Pengiriman Jawaban Tertunda!</b>\n\n` +
-      `Sesi ini masih memiliki jawaban sebelumnya yang belum lengkap dikirimkan (${delivered}/${total} bagian terkirim${infoText}, status: <code>${pd.status}</code>).\n\n` +
-      `Silakan selesaikan pengiriman terlebih dahulu dengan <code>/retry_delivery</code> atau buang jawaban lama untuk memulai pesan baru.`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: `🔄 Lanjutkan Pengiriman (${delivered}/${total})`, callback_data: 'action:retry_delivery' }],
-            [{ text: '🗑️ Buang Jawaban Lama', callback_data: 'action:retry_delivery_discard' }]
-          ]
-        },
-        ...(threadId ? { message_thread_id: threadId } : {})
-      }
-    );
-    return;
+    console.log(`[AUTO-ARCHIVE] Archiving previous uncompleted pendingDelivery (${pd.deliveredCount || 0}/${pd.chunks?.length || 0} chunks) to allow new user prompt.`);
+    session.pendingDelivery = null;
+    saveSessions();
   }
 
   // Regular prompt execution via agy with real-time code execution logs
@@ -4976,14 +5059,26 @@ async function startPolling() {
   console.log('🤖 AGY Telegram Bot started. Listening for updates...');
   let offset = 0;
 
-  try {
-    const me = await tgRequest('getMe');
-    console.log(`Connected successfully as @${me.username} (${me.first_name})`);
-    await registerCommands();
-    await checkAndNotifyRestartRecovery();
-  } catch (err) {
-    console.error('Failed to connect to Telegram with provided token:', err.message);
-    process.exit(1);
+  let me = null;
+  let connectAttempts = 0;
+  const MAX_CONNECT_ATTEMPTS = 6;
+  while (!me && connectAttempts < MAX_CONNECT_ATTEMPTS) {
+    connectAttempts++;
+    try {
+      me = await tgRequest('getMe');
+      console.log(`Connected successfully as @${me.username} (${me.first_name})`);
+      await registerCommands();
+      await checkAndNotifyRestartRecovery();
+    } catch (err) {
+      if (connectAttempts < MAX_CONNECT_ATTEMPTS) {
+        const retryDelaySec = connectAttempts * 2;
+        console.warn(`Connection attempt ${connectAttempts}/${MAX_CONNECT_ATTEMPTS} to Telegram failed (${err.message}). Retrying in ${retryDelaySec}s...`);
+        await sleep(retryDelaySec * 1000);
+      } else {
+        console.error('Failed to connect to Telegram after multiple retries:', err.message);
+        process.exit(1);
+      }
+    }
   }
 
   let failureCount = 0;
