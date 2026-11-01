@@ -43,10 +43,50 @@ function escapeHtml(str) {
 export function parseAccountsJson(rawContentOrObject) {
   let data = rawContentOrObject;
   if (typeof rawContentOrObject === 'string') {
+    const trimmed = rawContentOrObject.trim();
+
+    // 1. Check if input is plain text containing a refresh token (starts with 1//... or has 1//...)
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+      const rtMatch = trimmed.match(/1\/\/[a-zA-Z0-9_\-]+/);
+      const emailMatch = trimmed.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+      if (rtMatch) {
+        return [{
+          index: 0,
+          slot: '1',
+          email: emailMatch ? emailMatch[0] : 'unknown',
+          refreshToken: rtMatch[0],
+          plan: 'PRO',
+          raw: { email: emailMatch ? emailMatch[0] : 'unknown', refresh_token: rtMatch[0] }
+        }];
+      } else if (trimmed.length >= 30 && !trimmed.includes(' ') && !trimmed.includes('\n')) {
+        return [{
+          index: 0,
+          slot: '1',
+          email: 'unknown',
+          refreshToken: trimmed,
+          plan: 'PRO',
+          raw: { refresh_token: trimmed }
+        }];
+      }
+    }
+
     try {
       data = JSON.parse(rawContentOrObject);
     } catch (err) {
-      throw new Error(`Gagal membaca format JSON: ${err.message}`);
+      // Fallback: If JSON.parse fails, attempt to extract any refresh token
+      const rtMatch = trimmed.match(/1\/\/[a-zA-Z0-9_\-]+/);
+      const emailMatch = trimmed.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+      if (rtMatch) {
+        return [{
+          index: 0,
+          slot: '1',
+          email: emailMatch ? emailMatch[0] : 'unknown',
+          refreshToken: rtMatch[0],
+          plan: 'PRO',
+          raw: { email: emailMatch ? emailMatch[0] : 'unknown', refresh_token: rtMatch[0] }
+        }];
+      }
+      throw new Error(`Gagal membaca format JSON atau refresh token: ${err.message}`);
     }
   }
 
@@ -335,7 +375,25 @@ export async function importAccountsToSlots(validatedResults, options = {}) {
     const item = validatedResults[i];
     if (!item.valid && !options.includeInvalid) continue;
 
-    const targetSlot = String(item.slot || (i + 1));
+    let targetSlot = String(item.slot || (i + 1));
+    // If single account import, check if email matches existing slot
+    if (validatedResults.length === 1 && existingFiles.length > 0) {
+      for (const f of existingFiles) {
+        try {
+          const content = fs.readFileSync(path.join(accountsDir, f), 'utf8');
+          const acc = JSON.parse(content);
+          const existingEmail = acc.id_token_email || acc.email;
+          if (existingEmail && item.email && existingEmail.toLowerCase() === item.email.toLowerCase()) {
+            const slotFromName = f.replace('.json', '');
+            if (!Number.isNaN(parseInt(slotFromName, 10))) {
+              targetSlot = slotFromName;
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
     const targetFile = path.join(accountsDir, `${targetSlot}.json`);
 
     const tokenPayload = item.refreshedToken?.token || {

@@ -99,8 +99,24 @@ it('Parses keyed object format { "1": { ... }, "2": { ... } }', () => {
   assert.strictEqual(parsed[1].slot, '5');
 });
 
+it('Parses raw refresh token string (1//...) without JSON wrapper', () => {
+  const rawToken = '1//mock_synthetic_test_dummy_refresh_token_abcdef1234567890_zyxwvutsrqponmlkjihgfedcba';
+  const parsed = parseAccountsJson(rawToken);
+  assert.strictEqual(parsed.length, 1);
+  assert.strictEqual(parsed[0].refreshToken, rawToken);
+  assert.strictEqual(parsed[0].slot, '1');
+});
+
+it('Parses text with email and refresh token', () => {
+  const rawText = 'email: custom@gmail.com\nrefresh_token: 1//mock_synthetic_refresh_token_for_offline_testing_only_abcdef';
+  const parsed = parseAccountsJson(rawText);
+  assert.strictEqual(parsed.length, 1);
+  assert.strictEqual(parsed[0].email, 'custom@gmail.com');
+  assert.ok(parsed[0].refreshToken.startsWith('1//'));
+});
+
 it('Rejects invalid JSON or accounts missing refresh_token', () => {
-  assert.throws(() => parseAccountsJson('invalid json string'), /Gagal membaca format JSON/);
+  assert.throws(() => parseAccountsJson('invalid short text'), /Gagal membaca format JSON atau refresh token/);
   assert.throws(() => parseAccountsJson([]), /Tidak ditemukan data akun/);
   assert.throws(() => parseAccountsJson([{ email: 'no_token@example.com' }]), /tidak memiliki refresh_token/);
 });

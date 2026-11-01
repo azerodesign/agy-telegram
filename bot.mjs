@@ -86,6 +86,9 @@ const backgroundTasks = new Map();
 // Latest validated accounts cache for one-click import
 let latestValidatedAccounts = null;
 
+// Active /aglogin interactive prompt sessions: promptKey -> { startTime, threadId, slot }
+const activeAgloginPrompt = new Map();
+
 // Active cloudflare tunnels: port -> { child, url, startTime }
 const activeTunnels = new Map();
 
@@ -2997,35 +3000,26 @@ function executeShell(command, cwd) {
   });
 }
 
-// Multi-Account JSON File Validation & Import Orchestrator
-async function runAccountsValidationFlow(chatId, threadId = null, targetPath = null) {
-  const filePath = targetPath || '/home/ubuntu/antigravity_accounts_2026-10-28.json';
-  if (!fs.existsSync(filePath)) {
-    await sendRichMessage(chatId, `❌ <b>File Tidak Ditemukan:</b> <code>${escapeHtml(filePath)}</code>`, {
-      ...(threadId ? { message_thread_id: threadId } : {})
-    });
-    return;
-  }
-
+// Universal Account Processor: Validates in Sandbox & Automatically Saves to VPS
+async function processAndSaveAccounts(chatId, threadId, rawInput, sourceName = 'Input Akun') {
   let accounts = [];
   try {
-    const rawContent = fs.readFileSync(filePath, 'utf8');
-    accounts = parseAccountsJson(rawContent);
+    accounts = parseAccountsJson(rawInput);
   } catch (err) {
-    await sendRichMessage(chatId, `❌ <b>Gagal Membaca File Akun:</b>\n<code>${escapeHtml(err.message)}</code>`, {
-      ...(threadId ? { message_thread_id: threadId } : {})
-    });
+    await sendRichMessage(chatId,
+      `❌ <b>Format Akun Tidak Valid:</b>\n<code>${escapeHtml(err.message)}</code>\n\n` +
+      `<i>Silakan kirim file JSON yang valid atau teks refresh token (diawali 1//...).</i>`,
+      { ...(threadId ? { message_thread_id: threadId } : {}) }
+    );
     return;
   }
 
-  const baseFileName = path.basename(filePath);
   const total = accounts.length;
-
   let progressMsg = null;
   try {
     progressMsg = await tgRequest('sendMessage', {
       chat_id: chatId,
-      text: `⏳ <b>Memulai Validasi ${total} Akun:</b> <code>${escapeHtml(baseFileName)}</code>\n<i>Mempersiapkan isolated sandbox & Google Auth probe...</i>`,
+      text: `⏳ <b>Memulai Validasi & Penyimpanan ${total} Akun:</b> <code>${escapeHtml(sourceName)}</code>\n<i>Mempersiapkan isolated sandbox & Google Auth probe...</i>`,
       parse_mode: 'HTML',
       ...(threadId ? { message_thread_id: threadId } : {})
     });
@@ -3044,7 +3038,7 @@ async function runAccountsValidationFlow(chatId, threadId = null, targetPath = n
       await tgRequest('editMessageText', {
         chat_id: chatId,
         message_id: progressMsg.message_id,
-        text: `⏳ <b>Memvalidasi Akun (${idx + 1}/${count}):</b>\n• Memeriksa kredensial: <code>${escapeHtml(maskEmail(acc.email))}</code>\n• Sandbox: <i>Testing OAuth refresh & usage limits...</i>`,
+        text: `⏳ <b>Memvalidasi Akun (${idx + 1}/${count}):</b>\n• Memeriksa: <code>${escapeHtml(maskEmail(acc.email))}</code>\n• Sandbox: <i>Testing OAuth refresh & usage limits...</i>`,
         parse_mode: 'HTML'
       });
     } catch (_) {}
@@ -3052,41 +3046,119 @@ async function runAccountsValidationFlow(chatId, threadId = null, targetPath = n
 
   const valSummary = await validateAccountsBatch(accounts, { onProgress });
   latestValidatedAccounts = {
-    filePath,
+    sourceName,
     summary: valSummary,
     timestamp: Date.now()
   };
 
-  const reportText = formatValidationReport(valSummary, baseFileName);
+  if (valSummary.validCount === 0) {
+    const failMsg =
+      `❌ <b>Validasi Gagal!</b>\n\n` +
+      `Seluruh ${valSummary.total} akun yang dikirimkan tidak valid atau telah kedaluwarsa.\n\n` +
+      `<b>Detail Kesalahan:</b>\n` +
+      valSummary.results.map(r => `• Slot ${r.slot}: <code>${escapeHtml(r.errorMessage || 'Autentikasi ditolak')}</code>`).join('\n') +
+      `\n\n<i>Harap periksa kembali refresh token atau akun Google Anda.</i>`;
 
-  const inlineKeyboard = [];
-  if (valSummary.validCount > 0) {
-    inlineKeyboard.push([
-      { text: `📥 Import ke Slot 1-${valSummary.validCount}`, callback_data: 'action:import_accounts' }
-    ]);
+    if (progressMsg) {
+      try {
+        await tgRequest('editMessageText', {
+          chat_id: chatId,
+          message_id: progressMsg.message_id,
+          text: failMsg,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Coba Lagi', callback_data: 'action:validate_accounts' }],
+              [{ text: '⚙️ Buka Dashboard', callback_data: 'view:status' }]]
+          }
+        });
+        return;
+      } catch (_) {}
+    }
+    await sendRichMessage(chatId, failMsg, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+    return;
   }
-  inlineKeyboard.push([
-    { text: '🔄 Validasi Ulang', callback_data: 'action:validate_accounts' },
-    { text: '⚙️ Buka Dashboard', callback_data: 'view:status' }
-  ]);
 
-  if (progressMsg) {
-    try {
-      await tgRequest('editMessageText', {
-        chat_id: chatId,
-        message_id: progressMsg.message_id,
-        text: reportText,
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: inlineKeyboard }
+  // Automatically save & import validated accounts to VPS slots
+  try {
+    const importRes = await importAccountsToSlots(valSummary.results);
+    const backupNote = importRes.backupFile ? `\n• <b>Backup Otomatis:</b> <code>${escapeHtml(importRes.backupFile)}</code>` : '';
+
+    const slotLines = valSummary.results
+      .filter(r => r.valid)
+      .map(r => {
+        let usageSnippet = '';
+        if (r.usage?.gemini?.pct5h !== null) {
+          usageSnippet = ` <i>(Gemini: ${r.usage.gemini.pct5h}%)</i>`;
+        }
+        return `• 🟢 <b>Slot ${r.slot}:</b> <code>${escapeHtml(r.maskedEmail)}</code> [${r.plan}]${usageSnippet}`;
       });
-      return;
-    } catch (_) {}
+
+    const successReport =
+      `✅ <b>Akun Berhasil Divalidasi & Disimpan di VPS!</b>\n\n` +
+      `• <b>Sumber:</b> <code>${escapeHtml(sourceName)}</code>\n` +
+      `• <b>Total Diperiksa:</b> <b>${valSummary.total} akun</b>\n` +
+      `• <b>Tersimpan di VPS:</b> <b>${importRes.importedCount} akun</b> (⭐ PRO: ${valSummary.proCount} | 🆓 FREE: ${valSummary.freeCount})\n` +
+      `• <b>Slot Diperbarui:</b> <code>Slot ${importRes.importedSlots.join(', ')}</code>` +
+      backupNote +
+      `\n\n<b>Detail Akun Aktif:</b>\n` +
+      slotLines.join('\n') +
+      `\n\n<i>Kredensial disimpan dengan izin aman (0600) dan langsung aktif untuk rotasi round-robin!</i>`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: '📊 Cek Status Kuota', callback_data: 'view:usage' }, { text: '👥 AG Akun', callback_data: 'view:slots' }],
+        [{ text: '⚙️ Buka Dashboard', callback_data: 'view:status' }]
+      ]
+    };
+
+    if (progressMsg) {
+      try {
+        await tgRequest('editMessageText', {
+          chat_id: chatId,
+          message_id: progressMsg.message_id,
+          text: successReport,
+          parse_mode: 'HTML',
+          reply_markup: keyboard
+        });
+        return;
+      } catch (_) {}
+    }
+
+    await sendRichMessage(chatId, successReport, {
+      ...(threadId ? { message_thread_id: threadId } : {}),
+      reply_markup: keyboard
+    });
+  } catch (impErr) {
+    await sendRichMessage(chatId, `❌ <b>Gagal Menyimpan Akun ke VPS:</b> ${escapeHtml(impErr.message)}`, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+  }
+}
+
+// Multi-Account JSON File Validation & Import Orchestrator
+async function runAccountsValidationFlow(chatId, threadId = null, targetPath = null) {
+  const filePath = targetPath || '/home/ubuntu/antigravity_accounts_2026-10-28.json';
+  if (!fs.existsSync(filePath)) {
+    await sendRichMessage(chatId, `❌ <b>File Tidak Ditemukan:</b> <code>${escapeHtml(filePath)}</code>`, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+    return;
   }
 
-  await sendRichMessage(chatId, reportText, {
-    ...(threadId ? { message_thread_id: threadId } : {}),
-    reply_markup: { inline_keyboard: inlineKeyboard }
-  });
+  let rawContent = '';
+  try {
+    rawContent = fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    await sendRichMessage(chatId, `❌ <b>Gagal Membaca File:</b> ${escapeHtml(err.message)}`, {
+      ...(threadId ? { message_thread_id: threadId } : {})
+    });
+    return;
+  }
+
+  await processAndSaveAccounts(chatId, threadId, rawContent, path.basename(filePath));
 }
 
 // Callback Query Handler (Inline Keyboard)
@@ -3589,6 +3661,16 @@ async function handleCallback(cb) {
     return;
   }
 
+  // 1.7 Action Cancel Aglogin Prompt
+  if (data === 'action:cancel_aglogin') {
+    const promptKey = `${chatId}:${threadId || 'default'}`;
+    activeAgloginPrompt.delete(promptKey);
+    activeAgloginPrompt.delete(String(chatId));
+    await safeAnswer('Sesi /aglogin dibatalkan.');
+    await editRich(chatId, messageId, '🛑 <b>Sesi /aglogin telah dibatalkan.</b>');
+    return;
+  }
+
   // 2. View Models
   if (data === 'view:models') {
     const richDoc = tgRich.doc(
@@ -3956,6 +4038,55 @@ async function handleMessage(msg) {
       await sendRich(chatId, '❌ Gagal mengirimkan kode otorisasi ke proses login. Silakan coba lagi atau ketik /cancel.', threadId ? { message_thread_id: threadId } : {});
     }
     return;
+  }
+
+  // Active /aglogin Interactive Prompt Interceptor (awaiting JSON file or refresh token text)
+  const agloginKey = `${chatId}:${threadId || 'default'}`;
+  if (activeAgloginPrompt.has(agloginKey) || activeAgloginPrompt.has(String(chatId))) {
+    const activeKey = activeAgloginPrompt.has(agloginKey) ? agloginKey : String(chatId);
+    const promptInfo = activeAgloginPrompt.get(activeKey);
+
+    // 5-minute timeout check
+    if (Date.now() - promptInfo.startTime > 300000) {
+      activeAgloginPrompt.delete(activeKey);
+    } else {
+      const rawText = (msg.text || '').trim();
+
+      // Cancellation check
+      if (rawText === '/cancel' || rawText === '🛑 Batalkan') {
+        activeAgloginPrompt.delete(activeKey);
+        await sendRich(chatId, '🛑 <b>Sesi /aglogin telah dibatalkan.</b>');
+        return;
+      }
+
+      // Case A: User uploaded a file (JSON accounts document)
+      if (msg.document) {
+        activeAgloginPrompt.delete(activeKey);
+        sendChatAction(chatId, 'upload_document').catch(() => {});
+        try {
+          const fileId = msg.document.file_id;
+          const fileName = msg.document.file_name || 'accounts.json';
+          const saved = await downloadTelegramFile(fileId, session.workingDir, fileName);
+          const fileContent = fs.readFileSync(saved.path, 'utf8');
+          await processAndSaveAccounts(chatId, threadId, fileContent, saved.name);
+        } catch (err) {
+          await sendRich(chatId, `❌ <b>Gagal membaca file akun:</b> ${escapeHtml(err.message)}`);
+        }
+        return;
+      }
+
+      // Case B: User sent text (refresh token or JSON string)
+      if (rawText) {
+        if (rawText.startsWith('/') && !rawText.startsWith('/aglogin')) {
+          // Gracefully let other commands through
+          activeAgloginPrompt.delete(activeKey);
+        } else if (!rawText.startsWith('/')) {
+          activeAgloginPrompt.delete(activeKey);
+          await processAndSaveAccounts(chatId, threadId, rawText, 'Teks Refresh Token');
+          return;
+        }
+      }
+    }
   }
 
   // File Upload Handling
@@ -4384,24 +4515,26 @@ async function handleMessage(msg) {
     }
 
     if (!rawArg) {
-      const detectedSection = foundAccountsFile
-        ? `\n\n📄 <b>File Akun Terdeteksi:</b>\n<code>${escapeHtml(foundAccountsFile)}</code>\n<i>Klik tombol di bawah untuk memvalidasi akun!</i>`
-        : '';
+      // Interactive flow: register active aglogin prompt
+      const promptKey = `${chatId}:${threadId || 'default'}`;
+      activeAgloginPrompt.set(promptKey, { startTime: Date.now(), threadId });
 
       const keyboard = {
         inline_keyboard: [
-          ...(foundAccountsFile ? [[{ text: `🔍 Validasi ${path.basename(foundAccountsFile)}`, callback_data: 'action:validate_accounts' }]] : []),
-          [{ text: '👥 Daftar Akun (Slots)', callback_data: 'view:slots' }, { text: '📈 Cek Kuota', callback_data: 'view:usage' }]
+          ...(foundAccountsFile ? [[{ text: `🔍 Validasi & Simpan ${path.basename(foundAccountsFile)}`, callback_data: 'action:validate_accounts' }]] : []),
+          [{ text: '🛑 Batalkan', callback_data: 'action:cancel_aglogin' }]
         ]
       };
 
-      const helpText =
-        `🔐 <b>AGY Google Auth & Account Manager</b>\n\n` +
-        `• <b>Login Google Auth Manual:</b>\n  <code>/aglogin &lt;slot 1-14&gt;</code> (Contoh: <code>/aglogin 7</code>)\n\n` +
-        `• <b>Validasi & Import File Akun JSON:</b>\n  <code>/aglogin validate [path_file]</code>\n  (Contoh: <code>/aglogin validate /home/ubuntu/antigravity_accounts_2026-10-28.json</code>)` +
-        detectedSection;
+      const promptMsg =
+        `🔐 <b>AGY Login & Sinkronisasi Akun</b>\n\n` +
+        `Silakan <b>kirim file JSON</b> akun Anda atau <b>kirim teks refresh token</b>:\n\n` +
+        `• 📁 <b>File JSON:</b> Unggah file dokumen <code>.json</code> (misal <code>antigravity_accounts_2026-10-28.json</code>)\n` +
+        `• 📝 <b>Teks Token:</b> Kirim teks refresh token (diawali <code>1//...</code>) atau format JSON langsung\n\n` +
+        `<i>⚡ Setelah Anda mengirim file atau teks, bot akan otomatis memvalidasi kredensial di sandbox dan langsung menyimpannya ke VPS.</i>\n\n` +
+        `<i>Ketik /cancel untuk membatalkan sesi ini.</i>`;
 
-      await sendRich(chatId, helpText, { reply_markup: keyboard });
+      await sendRich(chatId, promptMsg, { reply_markup: keyboard });
       return;
     }
 
